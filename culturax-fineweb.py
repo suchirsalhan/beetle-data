@@ -31,7 +31,7 @@ TMP = Path("ultra_tmp")
 TMP.mkdir(exist_ok=True)
 
 CPU = os.cpu_count()
-TOKEN_WORKERS = max(8, (CPU - 8) if CPU > 8 else 4) 
+TOKEN_WORKERS = max(8, CPU - 8) if CPU > 8 else 4
 
 api = HfApi()
 
@@ -158,8 +158,8 @@ def run_language(lang):
             if tokens_processed >= TARGETS[lang]:
                 break
             
-            if tokens_processed % 50_000_000 < 5000: 
-                 print(f"📊 {lang}: ~{tokens_processed/1e9:.2f}B / {TARGETS[lang]/1e9:.1f}B tokens")
+            if tokens_processed % 50_000_000 < 5000:
+                print(f"📊 {lang}: ~{tokens_processed/1e9:.2f}B / {TARGETS[lang]/1e9:.1f}B tokens")
     except Exception as e:
         print(f"❌ Error in streaming {lang}: {e}")
 
@@ -176,7 +176,7 @@ def run_language(lang):
     w_proc.join()
     
     upload_q.put(None)
-    up_thread.join() 
+    up_thread.join()
     
     print(f"✅ [FINISHED] {lang} in {(time.time()-start_time)/3600:.2f} hours")
 
