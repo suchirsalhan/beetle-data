@@ -11,11 +11,14 @@ import pyarrow.ipc as ipc
 import numpy as np
 from datasets import load_dataset
 from huggingface_hub import HfApi, create_repo
-from transformers import AutoTokenizer # Changed to AutoTokenizer for "Fast" support
+from transformers import AutoTokenizer
 
 # =====================================================
 # CONFIG
 # =====================================================
+# This prevents warnings when using multi-processing with Fast Tokenizers
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
 HF_USER = "RA-ALTA"
 SEQ_LEN = 512
 
@@ -31,7 +34,7 @@ TMP.mkdir(exist_ok=True)
 
 # Use the massive CPU count of the A100 node
 CPU = os.cpu_count()
-TOKEN_WORKERS = max(8, CPU - 8) # Leave a few cores for I/O and OS
+TOKEN_WORKERS = max(8, CPU - 8) 
 
 api = HfApi()
 
@@ -41,22 +44,28 @@ api = HfApi()
 
 def stream(lang):
     """Generator for streaming dataset text."""
-    ds_name = "HuggingFaceFW/fineweb-edu" if lang == "en" else "uonlp/CulturaX"
+    if lang == "en":
+        ds_name = "HuggingFaceFW/fineweb-edu"
+        subset = "default" 
+    else:
+        ds_name = "uonlp/CulturaX"
+        subset = lang 
+
     ds_args = {"split": "train", "streaming": True}
-    if lang != "en": ds_args["path"] = lang
     
-    ds = load_dataset(ds_name, **ds_args)
+    # Corrected: ds_name is 'path', subset is 'name'
+    ds = load_dataset(ds_name, subset, **ds_args)
+    
     for ex in ds:
         t = ex.get("text")
         if t: yield t.replace("\n", " ")
 
 def tokenizer_worker(in_q, out_q, tokenizer_path):
-    """Uses Fast Tokenizer (Rust) for 10x speed over standard LlamaTokenizer."""
+    """Uses Fast Tokenizer (Rust) for high-speed CPU processing."""
     tok = AutoTokenizer.from_pretrained(tokenizer_path, use_fast=True)
     while True:
         text = in_q.get()
         if text is None: break
-        # Fast tokenizer handles batching/multithreading internally if needed
         ids = tok.encode(text, add_special_tokens=False)
         out_q.put(ids)
 
@@ -72,7 +81,7 @@ def packer(token_q, block_q):
 
 def arrow_writer(lang, block_q, upload_q):
     shard_id, shard_tokens = 0, 0
-    adaptive_target = 10_000_000 # Start with 10M tokens per shard
+    adaptive_target = 10_000_000 
     arrays = []
 
     while True:
@@ -90,7 +99,7 @@ def arrow_writer(lang, block_q, upload_q):
             shard_id += 1
             shard_tokens = 0
             arrays = []
-            adaptive_target = min(int(adaptive_target * 1.1), 100_000_000) # Cap shard size at 100M tokens
+            adaptive_target = min(int(adaptive_target * 1.1), 100_000_000)
 
 def uploader(upload_q):
     while True:
@@ -99,7 +108,12 @@ def uploader(upload_q):
         lang, shard, fname = item
         repo = f"{HF_USER}/{lang}-512"
         create_repo(repo, repo_type="dataset", exist_ok=True)
-        api.upload_file(path_or_fileobj=str(fname), path_in_repo=f"train_{shard}.arrow", repo_id=repo, repo_type="dataset")
+        api.upload_file(
+            path_or_fileobj=str(fname), 
+            path_in_repo=f"train_{shard}.arrow", 
+            repo_id=repo, 
+            repo_type="dataset"
+        )
         os.remove(fname)
 
 # =====================================================
@@ -107,12 +121,14 @@ def uploader(upload_q):
 # =====================================================
 
 def run_language(lang):
-    print(f"🚀 [STARTING] Language: {lang} | Target: {TARGETS[lang]} tokens")
-    text_q, token_q, block_q, upload_q = mp.Queue(5000), mp.Queue(5000), mp.Queue(5000), mp.Queue()
+    print(f"\n🚀 [STARTING] Language: {lang} | Target: {TARGETS[lang]} tokens")
+    text_q = mp.Queue(5000)
+    token_q = mp.Queue(5000)
+    block_q = mp.Queue(5000)
+    upload_q = mp.Queue()
     
     tokenizer_path = f"{HF_USER}/tokenizer-{lang}"
     
-    # Spin up workers
     tok_procs = [mp.Process(target=tokenizer_worker, args=(text_q, token_q, tokenizer_path)) for _ in range(TOKEN_WORKERS)]
     for w in tok_procs: w.start()
     
@@ -126,12 +142,16 @@ def run_language(lang):
     tokens_processed = 0
     start_time = time.time()
 
-    for text in stream(lang):
-        text_q.put(text)
-        tokens_processed += (len(text) // 4) # Rough estimate (4 chars per token)
-        if tokens_processed >= TARGETS[lang]: break
+    try:
+        for text in stream(lang):
+            text_q.put(text)
+            # Rough token estimate for progress logging (4 chars per token average)
+            tokens_processed += (len(text) // 4) 
+            if tokens_processed >= TARGETS[lang]: break
+    except Exception as e:
+        print(f"❌ Error in streaming {lang}: {e}")
 
-    # Shutdown sequence
+    # Shutdown sequence for current language
     for _ in tok_procs: text_q.put(None)
     for w in tok_procs: w.join()
     token_q.put(None); p_proc.join()
@@ -141,10 +161,9 @@ def run_language(lang):
     print(f"✅ [FINISHED] {lang} in {(time.time()-start_time)/3600:.2f} hours")
 
 def main():
-    # RUN SEQUENTIALLY to avoid crashing the node and OOMing RAM
     for lang in TARGETS:
         run_language(lang)
 
 if __name__ == "__main__":
-    mp.set_start_method("spawn")
+    mp.set_start_method("spawn", force=True)
     main()
