@@ -1,0 +1,16 @@
+# Data Processing & Streaming
+datasets
+pyarrow
+numpy
+
+# Tokenization & Model Handling
+transformers
+tokenizers
+sentencepiece
+protobuf
+
+# Hugging Face Utilities
+huggingface_hub
+
+# Performance & Environment
+accelerate
