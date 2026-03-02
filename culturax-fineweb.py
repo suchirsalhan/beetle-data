@@ -31,7 +31,7 @@ TMP = Path("ultra_tmp")
 TMP.mkdir(exist_ok=True)
 
 CPU = os.cpu_count()
-TOKEN_WORKERS = max(8, CPU - 8) 
+TOKEN_WORKERS = max(8, (CPU - 8) if CPU > 8 else 4) 
 
 api = HfApi()
 
@@ -40,7 +40,6 @@ api = HfApi()
 # =====================================================
 
 def stream(lang):
-    """Generator for streaming dataset text."""
     if lang == "en":
         ds_name = "HuggingFaceFW/fineweb-edu"
         subset = "default" 
@@ -53,13 +52,15 @@ def stream(lang):
     
     for ex in ds:
         t = ex.get("text")
-        if t: yield t.replace("\n", " ")
+        if t:
+            yield t.replace("\n", " ")
 
 def tokenizer_worker(in_q, out_q, tokenizer_path):
     tok = AutoTokenizer.from_pretrained(tokenizer_path, use_fast=True)
     while True:
         text = in_q.get()
-        if text is None: break
+        if text is None:
+            break
         ids = tok.encode(text, add_special_tokens=False)
         out_q.put(ids)
 
@@ -67,7 +68,8 @@ def packer(token_q, block_q):
     buffer = []
     while True:
         ids = token_q.get()
-        if ids is None: break
+        if ids is None:
+            break
         buffer.extend(ids)
         while len(buffer) >= SEQ_LEN:
             block_q.put(np.array(buffer[:SEQ_LEN], dtype=np.int32))
@@ -80,7 +82,8 @@ def arrow_writer(lang, block_q, upload_q):
 
     while True:
         block = block_q.get()
-        if block is None: break
+        if block is None:
+            break
         arrays.append(pa.array([block]))
         shard_tokens += SEQ_LEN
 
@@ -99,11 +102,11 @@ def uploader(upload_q):
     """Handles repo creation check and sequential uploads."""
     while True:
         item = upload_q.get()
-        if item is None: break
+        if item is None:
+            break
         lang, shard, fname = item
         repo_id = f"{HF_USER}/{lang}-512"
         
-        # Safe upload
         try:
             api.upload_file(
                 path_or_fileobj=str(fname), 
@@ -122,7 +125,6 @@ def uploader(upload_q):
 def run_language(lang):
     print(f"\n🚀 [STARTING] Language: {lang} | Target: {TARGETS[lang]} tokens")
     
-    # ENSURE REPO EXISTS BEFORE STARTING
     repo_id = f"{HF_USER}/{lang}-512"
     print(f"📦 Ensuring repository {repo_id} exists...")
     create_repo(repo_id, repo_type="dataset", exist_ok=True)
@@ -135,13 +137,14 @@ def run_language(lang):
     tokenizer_path = f"{HF_USER}/tokenizer-{lang}"
     
     tok_procs = [mp.Process(target=tokenizer_worker, args=(text_q, token_q, tokenizer_path)) for _ in range(TOKEN_WORKERS)]
-    for w in tok_procs: w.start()
+    for w in tok_procs:
+        w.start()
     
     p_proc = mp.Process(target=packer, args=(token_q, block_q))
     w_proc = mp.Process(target=arrow_writer, args=(lang, block_q, upload_q))
-    p_proc.start(); w_proc.start()
+    p_proc.start()
+    w_proc.start()
     
-    # Start uploader as a thread so it can access the same api object
     up_thread = Thread(target=uploader, args=(upload_q,))
     up_thread.start()
 
@@ -152,20 +155,28 @@ def run_language(lang):
         for text in stream(lang):
             text_q.put(text)
             tokens_processed += (len(text) // 4) 
-            if tokens_processed >= TARGETS[lang]: break
+            if tokens_processed >= TARGETS[lang]:
+                break
             
-            if tokens_processed % 50_000_000 < 5000: # Log every ~50M tokens
+            if tokens_processed % 50_000_000 < 5000: 
                  print(f"📊 {lang}: ~{tokens_processed/1e9:.2f}B / {TARGETS[lang]/1e9:.1f}B tokens")
     except Exception as e:
         print(f"❌ Error in streaming {lang}: {e}")
 
-    # Shutdown sequence
     print(f"⏳ Finishing up {lang}...")
-    for _ in tok_procs: text_q.put(None)
-    for w in tok_procs: w.join()
-    token_q.put(None); p_proc.join()
-    block_q.put(None); w_proc.join()
-    upload_q.put(None); up_thread.join() # Join the uploader to ensure all shards are pushed
+    for _ in tok_procs:
+        text_q.put(None)
+    for w in tok_procs:
+        w.join()
+        
+    token_q.put(None)
+    p_proc.join()
+    
+    block_q.put(None)
+    w_proc.join()
+    
+    upload_q.put(None)
+    up_thread.join() 
     
     print(f"✅ [FINISHED] {lang} in {(time.time()-start_time)/3600:.2f} hours")
 
