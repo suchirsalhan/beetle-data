@@ -16,13 +16,11 @@ from transformers import AutoTokenizer
 # =====================================================
 # CONFIG
 # =====================================================
-# This prevents warnings when using multi-processing with Fast Tokenizers
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 HF_USER = "RA-ALTA"
 SEQ_LEN = 512
 
-# Total targets (36 Billion tokens)
 TARGETS = {
     "es": 4_000_000_000, "fr": 4_000_000_000, "de": 4_000_000_000,
     "pl": 4_000_000_000, "tr": 4_000_000_000, "ar": 4_000_000_000,
@@ -32,7 +30,6 @@ TARGETS = {
 TMP = Path("ultra_tmp")
 TMP.mkdir(exist_ok=True)
 
-# Use the massive CPU count of the A100 node
 CPU = os.cpu_count()
 TOKEN_WORKERS = max(8, CPU - 8) 
 
@@ -52,8 +49,6 @@ def stream(lang):
         subset = lang 
 
     ds_args = {"split": "train", "streaming": True}
-    
-    # Corrected: ds_name is 'path', subset is 'name'
     ds = load_dataset(ds_name, subset, **ds_args)
     
     for ex in ds:
@@ -61,7 +56,6 @@ def stream(lang):
         if t: yield t.replace("\n", " ")
 
 def tokenizer_worker(in_q, out_q, tokenizer_path):
-    """Uses Fast Tokenizer (Rust) for high-speed CPU processing."""
     tok = AutoTokenizer.from_pretrained(tokenizer_path, use_fast=True)
     while True:
         text = in_q.get()
@@ -102,19 +96,24 @@ def arrow_writer(lang, block_q, upload_q):
             adaptive_target = min(int(adaptive_target * 1.1), 100_000_000)
 
 def uploader(upload_q):
+    """Handles repo creation check and sequential uploads."""
     while True:
         item = upload_q.get()
         if item is None: break
         lang, shard, fname = item
-        repo = f"{HF_USER}/{lang}-512"
-        create_repo(repo, repo_type="dataset", exist_ok=True)
-        api.upload_file(
-            path_or_fileobj=str(fname), 
-            path_in_repo=f"train_{shard}.arrow", 
-            repo_id=repo, 
-            repo_type="dataset"
-        )
-        os.remove(fname)
+        repo_id = f"{HF_USER}/{lang}-512"
+        
+        # Safe upload
+        try:
+            api.upload_file(
+                path_or_fileobj=str(fname), 
+                path_in_repo=f"train_{shard}.arrow", 
+                repo_id=repo_id, 
+                repo_type="dataset"
+            )
+            os.remove(fname)
+        except Exception as e:
+            print(f"❌ Upload failed for {fname}: {e}")
 
 # =====================================================
 # EXECUTION
@@ -122,6 +121,12 @@ def uploader(upload_q):
 
 def run_language(lang):
     print(f"\n🚀 [STARTING] Language: {lang} | Target: {TARGETS[lang]} tokens")
+    
+    # ENSURE REPO EXISTS BEFORE STARTING
+    repo_id = f"{HF_USER}/{lang}-512"
+    print(f"📦 Ensuring repository {repo_id} exists...")
+    create_repo(repo_id, repo_type="dataset", exist_ok=True)
+
     text_q = mp.Queue(5000)
     token_q = mp.Queue(5000)
     block_q = mp.Queue(5000)
@@ -136,7 +141,8 @@ def run_language(lang):
     w_proc = mp.Process(target=arrow_writer, args=(lang, block_q, upload_q))
     p_proc.start(); w_proc.start()
     
-    up_thread = Thread(target=uploader, args=(upload_q,), daemon=True)
+    # Start uploader as a thread so it can access the same api object
+    up_thread = Thread(target=uploader, args=(upload_q,))
     up_thread.start()
 
     tokens_processed = 0
@@ -145,18 +151,21 @@ def run_language(lang):
     try:
         for text in stream(lang):
             text_q.put(text)
-            # Rough token estimate for progress logging (4 chars per token average)
             tokens_processed += (len(text) // 4) 
             if tokens_processed >= TARGETS[lang]: break
+            
+            if tokens_processed % 50_000_000 < 5000: # Log every ~50M tokens
+                 print(f"📊 {lang}: ~{tokens_processed/1e9:.2f}B / {TARGETS[lang]/1e9:.1f}B tokens")
     except Exception as e:
         print(f"❌ Error in streaming {lang}: {e}")
 
-    # Shutdown sequence for current language
+    # Shutdown sequence
+    print(f"⏳ Finishing up {lang}...")
     for _ in tok_procs: text_q.put(None)
     for w in tok_procs: w.join()
     token_q.put(None); p_proc.join()
     block_q.put(None); w_proc.join()
-    upload_q.put(None)
+    upload_q.put(None); up_thread.join() # Join the uploader to ensure all shards are pushed
     
     print(f"✅ [FINISHED] {lang} in {(time.time()-start_time)/3600:.2f} hours")
 
