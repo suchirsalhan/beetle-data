@@ -8,6 +8,7 @@ transformers
 tokenizers
 sentencepiece
 protobuf
+tiktoken
 
 # Hugging Face Utilities
 huggingface_hub
