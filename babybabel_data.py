@@ -1,15 +1,14 @@
 """
 build_babybabel.py
 ==================
-Download all BabyLM source datasets, tokenize in parallel across all CPU cores,
-slice each language independently at 33M / 50M / 100M token thresholds, then
-push 27 monolingual datasets to HuggingFace as:
+Stream all BabyLM source datasets, tokenize in parallel across all CPU cores,
+slice each language independently at 11 token thresholds, then push 99
+monolingual datasets to HuggingFace as:
 
-  BeetleLM/BabyBabel-{lang}-33
-  BeetleLM/BabyBabel-{lang}-50
-  BeetleLM/BabyBabel-{lang}-100
+  BeetleLM/BabyBabel-{lang}-{target}
+  e.g. BeetleLM/BabyBabel-bul-33M, BeetleLM/BabyBabel-eng-100M, ...
 
-  e.g. BeetleLM/BabyBabel-bul-33, BeetleLM/BabyBabel-eng-100, ...
+  9 languages × 11 targets = 99 datasets
 
 Usage
 -----
@@ -17,24 +16,39 @@ Usage
   huggingface-cli login          # or set HF_TOKEN env var
   python build_babybabel.py
 
-Parallelism strategy (128-core Xeon Platinum 8358, 2 NUMA nodes)
------------------------------------------------------------------
-  * Downloads     — 9 threads (ThreadPoolExecutor); I/O bound, no GIL issue
-  * Tokenization  — single persistent Pool(126 workers) shared across all langs;
-                    avoids 9× spawn overhead; large BATCH_SIZE (16k) keeps
-                    workers fed and amortises IPC overhead
-  * HF pushes     — up to 9 concurrent threads; network-bound
-  * A100s         — tiktoken is CPU-only; GPUs are not used here.
-                    They will be useful when you train on these datasets.
+Runtime estimate (128-core Xeon, 8× A100, data-centre uplink)
+--------------------------------------------------------------
+  Step 1+2  stream + tokenize + slice   ~3–5 min   (CPU-bound, 126 workers)
+  Step 3    pre-create 99 repos         ~15–30 sec  (pure REST, 99 threads)
+  Step 4a   stage 1 — small  (36 repos) ~6–10 min  (8 upload threads)
+  Step 4b   stage 2 — medium (36 repos) ~8–14 min  (8 upload threads)
+  Step 4c   stage 3 — large  (27 repos) ~8–14 min  (8 upload threads)
+  ─────────────────────────────────────────────────────────────────────
+  Total                                 ~25–45 min
+
+  A100s: not used — tiktoken and HF uploads are CPU/network-bound.
+  They will be useful when training on the resulting datasets.
+
+Push strategy
+-------------
+  1. Pre-create all 99 repos in parallel (99 threads, pure API — no data).
+     This removes create_repo() latency from inside each upload thread.
+  2. Push in 3 stages sorted by dataset size (small → large).
+     Smaller datasets go first so you get early validation and partial
+     results faster.  Within each stage, 8 concurrent upload threads.
+
+  Stage 1  targets 10M–33M   → 36 repos  (≤33M tokens each)
+  Stage 2  targets 40M–66M   → 36 repos  (40M–66M tokens each)
+  Stage 3  targets 70M–100M  → 27 repos  (70M–100M tokens each)
 """
 
 import os
 import multiprocessing as mp
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
+import time
 
 from datasets import load_dataset, Dataset, DatasetDict
 from huggingface_hub import HfApi
-import tiktoken
 from tqdm import tqdm
 
 # ── Configuration ─────────────────────────────────────────────────────────────
@@ -53,175 +67,253 @@ SOURCES = {
     "ukr": "BabyLM-community/babylm-ukr",
 }
 
+# Must be defined in ascending order — slice_language() depends on this.
 TARGETS = {
-    "33":  33_000_000,
-    "50":  50_000_000,
-    "100": 100_000_000,
+    "10M":  10_000_000,
+    "20M":  20_000_000,
+    "30M":  30_000_000,
+    "33M":  33_000_000,
+    "40M":  40_000_000,
+    "50M":  50_000_000,
+    "60M":  60_000_000,
+    "66M":  66_000_000,
+    "70M":  70_000_000,
+    "80M":  80_000_000,
+    "100M": 100_000_000,
 }
 
-TEXT_FIELD   = "text"
-BATCH_SIZE   = 16_000                      # large batches → less IPC overhead
-NUM_WORKERS  = max(1, mp.cpu_count() - 2)  # leave 2 cores free for I/O / main
-MAX_PUSH_THREADS = 9                        # one per language; HF rate-limits above ~10
+# Push stages — group targets by size so small datasets go first.
+# Each stage is pushed fully before the next begins.
+PUSH_STAGES = [
+    ["10M", "20M", "30M", "33M"],          # stage 1 — small
+    ["40M", "50M", "60M", "66M"],          # stage 2 — medium
+    ["70M", "80M", "100M"],                # stage 3 — large
+]
+
+TEXT_FIELD        = "text"
+BATCH_SIZE        = 16_000  # large batches → less IPC overhead on 128-core machine
+NUM_WORKERS       = max(1, mp.cpu_count() - 2)
+PUSH_THREADS      = 8       # concurrent upload threads per stage
+PRECREATE_THREADS = 99      # one per repo — pure REST calls, very fast
+SHUFFLE_SEED      = 42
 
 
-# ── Token counting (runs in worker processes) ─────────────────────────────────
+# ── Tokenizer worker initializer ──────────────────────────────────────────────
+
+ENC = None  # global per-worker encoder
+
+def _init_worker():
+    """Load tiktoken once per worker process — not once per batch."""
+    global ENC
+    import tiktoken
+    ENC = tiktoken.get_encoding("cl100k_base")
 
 def _count_batch(texts: list[str]) -> list[int]:
-    """Count tokens for a batch of texts. Runs inside persistent worker processes."""
-    enc = tiktoken.get_encoding("cl100k_base")
-    return [len(enc.encode(t, disallowed_special=())) for t in texts]
+    """Tokenize a batch of texts. ENC is pre-loaded by _init_worker."""
+    return [len(ENC.encode(t, disallowed_special=())) for t in texts]
 
 
-# ── Step 1 — Parallel download ────────────────────────────────────────────────
+# ── Step 1+2 — Stream, tokenize, and slice one language ──────────────────────
 
-def _download_one(lang_and_id: tuple[str, str]) -> tuple[str, list[dict]]:
-    lang, ds_id = lang_and_id
-    ds = load_dataset(ds_id, split="train", trust_remote_code=True)
-    rows = [
-        {"text": row[TEXT_FIELD], "language": lang, "source": ds_id}
-        for row in ds
-        if row.get(TEXT_FIELD, "").strip()
-    ]
-    return lang, rows
-
-
-def download_all() -> dict[str, list[dict]]:
-    """
-    Download all 9 datasets concurrently (I/O bound → ThreadPoolExecutor).
-    HuggingFace caches shards locally; subsequent runs skip the download.
-    """
-    all_data: dict[str, list[dict]] = {}
-    with ThreadPoolExecutor(max_workers=len(SOURCES)) as executor:
-        futures = {
-            executor.submit(_download_one, item): item[0]
-            for item in SOURCES.items()
-        }
-        for future in tqdm(as_completed(futures), total=len(futures),
-                           desc="  downloading", unit="lang"):
-            lang = futures[future]
-            try:
-                lang, rows = future.result()
-                all_data[lang] = rows
-                tqdm.write(f"  ✓ {lang:4s}  {len(rows):>10,} rows")
-            except Exception as exc:
-                tqdm.write(f"  ✗ {lang:4s}  FAILED: {exc}")
-    return all_data
-
-
-# ── Step 2 — Parallel tokenization (single persistent pool) ──────────────────
-
-def tokenize_all(
-    all_data: dict[str, list[dict]],
+def process_language(
+    lang: str,
+    ds_id: str,
     pool: mp.Pool,
-) -> dict[str, list[int]]:
-    """
-    Tokenize every language using one shared Pool — avoids 9× spawn overhead.
-    Returns {lang: [token_count_per_row]}.
-    """
-    token_counts: dict[str, list[int]] = {}
-    total_rows = sum(len(v) for v in all_data.values())
-
-    with tqdm(total=total_rows, unit="rows", desc="  tokenising") as pbar:
-        for lang, rows in all_data.items():
-            texts   = [r["text"] for r in rows]
-            batches = [texts[i : i + BATCH_SIZE]
-                       for i in range(0, len(texts), BATCH_SIZE)]
-            counts: list[int] = []
-            for batch_counts in pool.imap(_count_batch, batches):
-                counts.extend(batch_counts)
-                pbar.update(len(batch_counts))
-            token_counts[lang] = counts
-
-    return token_counts
-
-
-# ── Step 3 — Per-language slice ───────────────────────────────────────────────
-
-def slice_language(
-    rows: list[dict],
-    counts: list[int],
 ) -> dict[str, list[dict]]:
     """
-    For a single language, accumulate rows until each token threshold is hit.
-    Returns {target_key: [rows]}.  If corpus is exhausted before a threshold,
-    returns all available rows for that target (with a warning).
+    Stream one language, tokenize via the shared pool, accumulate into
+    per-threshold buffers without ever holding the full dataset in RAM.
+
+    No-overshoot rule: a row is only added to bucket[key] if
+    running + n_tok <= threshold.  This keeps each dataset strictly
+    within its token budget.
+
+    Returns {target_key: [rows]}.
     """
     sorted_targets = sorted(TARGETS.items(), key=lambda kv: kv[1])
-    buffers: dict[str, list[dict]] = {k: [] for k in TARGETS}
-    filled:  set[str] = set()
-    running = 0
 
-    for row, n_tok in zip(rows, counts):
-        if n_tok == 0:
+    buffers:  dict[str, list[dict]] = {k: [] for k in TARGETS}
+    filled:   set[str] = set()
+    running   = 0
+    rows_seen = 0
+
+    ds = load_dataset(ds_id, split="train", trust_remote_code=True, streaming=True)
+    ds = ds.shuffle(seed=SHUFFLE_SEED, buffer_size=10_000)
+
+    pending: list[dict] = []
+
+    def flush(batch: list[dict]) -> bool:
+        nonlocal running
+
+        texts = [r["text"] for r in batch]
+        counts: list[int] = []
+        sub_batches = [texts[i : i + BATCH_SIZE]
+                       for i in range(0, len(texts), BATCH_SIZE)]
+        for result in pool.imap(_count_batch, sub_batches):
+            counts.extend(result)
+
+        for row, n_tok in zip(batch, counts):
+            if n_tok == 0:
+                continue
+
+            # Add to every open bucket that won't be pushed over threshold
+            for key, threshold in sorted_targets:
+                if key not in filled and running + n_tok <= threshold:
+                    buffers[key].append(row)
+
+            running += n_tok
+
+            for key, threshold in sorted_targets:
+                if key not in filled and running >= threshold:
+                    filled.add(key)
+
+            if len(filled) == len(TARGETS):
+                return True
+
+        return False
+
+    for hf_row in ds:
+        text = hf_row.get(TEXT_FIELD, "").strip()
+        if not text:
             continue
-        running += n_tok
+        rows_seen += 1
+        pending.append({"text": text, "language": lang, "source": ds_id})
 
-        for key, _ in sorted_targets:
-            if key not in filled:
-                buffers[key].append(row)
+        if len(pending) >= BATCH_SIZE:
+            if flush(pending):
+                pending = []
+                break
+            pending = []
 
-        for key, threshold in sorted_targets:
-            if key not in filled and running >= threshold:
-                filled.add(key)
+    if pending:
+        flush(pending)
 
-        if len(filled) == len(TARGETS):
-            break
-
-    # Warn for any threshold not reached
     for key, threshold in sorted_targets:
         if key not in filled:
             tqdm.write(
-                f"    WARNING: corpus exhausted at {running:,} tok "
-                f"-- {key}M target not met, using all {len(buffers[key]):,} rows"
+                f"  [{lang}] WARNING: corpus exhausted at {running:,} tok "
+                f"-- {key} target not met, using all {len(buffers[key]):,} rows"
             )
 
+    tqdm.write(
+        f"  ✓ {lang:4s}  rows={rows_seen:,}  tokens≈{running:,}  "
+        f"thresholds={len(filled)}/{len(TARGETS)}"
+    )
     return buffers
 
 
-# ── Step 4 — Push to Hub (concurrent) ────────────────────────────────────────
+# ── Step 3 — Pre-create all repos in parallel ─────────────────────────────────
 
-def _push_one(args: tuple) -> str:
-    lang, key, threshold, rows, token = args
-    repo_id = f"{HF_ORG}/BabyBabel-{lang}-{key}"
-    api = HfApi()
+def precreate_all_repos(all_buffers: dict[str, dict[str, list[dict]]]):
+    """
+    Fire off create_repo() for every non-empty repo concurrently.
+    These are lightweight REST calls — no data transfer.
+    All repos exist before any upload begins, so uploads never stall
+    waiting for repo creation.
+    """
+    hf_token = os.environ.get("HF_TOKEN")
 
-    ds_dict = DatasetDict({"train": Dataset.from_list(rows)})
-    try:
-        api.create_repo(repo_id=repo_id, repo_type="dataset", exist_ok=True)
-    except Exception as exc:
-        tqdm.write(f"    [warn] create_repo {repo_id}: {exc}")
-
-    ds_dict.push_to_hub(
-        repo_id,
-        token=token,
-        commit_message=f"Add BabyBabel-{lang}-{key} ({threshold // 1_000_000}M-token slice)",
-    )
-    return repo_id
-
-
-def push_all(all_buffers: dict[str, dict[str, list[dict]]]):
-    """Push all 27 datasets concurrently (network-bound → ThreadPoolExecutor)."""
-    token = os.environ.get("HF_TOKEN")
-
-    push_jobs = [
-        (lang, key, threshold, all_buffers[lang][key], token)
+    repo_ids = [
+        f"{HF_ORG}/BabyBabel-{lang}-{key}"
         for lang in all_buffers
-        for key, threshold in TARGETS.items()
+        for key in TARGETS
+        if all_buffers[lang].get(key)
     ]
 
-    print(f"\n  Pushing {len(push_jobs)} datasets ({MAX_PUSH_THREADS} concurrent threads) ...")
-    with ThreadPoolExecutor(max_workers=MAX_PUSH_THREADS) as executor:
-        futures = {executor.submit(_push_one, job): job for job in push_jobs}
+    print(f"\n  Pre-creating {len(repo_ids)} repos ({PRECREATE_THREADS} threads) ...")
+    t0 = time.time()
+
+    def _create(repo_id: str):
+        api = HfApi()
+        api.create_repo(repo_id=repo_id, repo_type="dataset",
+                        exist_ok=True, token=hf_token)
+        return repo_id
+
+    ok = failed = 0
+    with ThreadPoolExecutor(max_workers=PRECREATE_THREADS) as executor:
+        futures = {executor.submit(_create, r): r for r in repo_ids}
         for future in tqdm(as_completed(futures), total=len(futures),
-                           desc="  pushing", unit="repo"):
-            job = futures[future]
-            lang, key = job[0], job[1]
+                           desc="  creating repos", unit="repo"):
             try:
-                repo_id = future.result()
-                tqdm.write(f"  ✓ pushed {repo_id}  ({len(job[3]):,} rows)")
+                future.result()
+                ok += 1
             except Exception as exc:
-                tqdm.write(f"  ✗ FAILED {HF_ORG}/BabyBabel-{lang}-{key}: {exc}")
+                tqdm.write(f"  [warn] {futures[future]}: {exc}")
+                failed += 1
+
+    elapsed = time.time() - t0
+    print(f"  Done in {elapsed:.1f}s — {ok} created, {failed} failed")
+
+
+# ── Step 4 — Staged concurrent push ──────────────────────────────────────────
+
+def _push_one(args: tuple) -> tuple[str, int]:
+    lang, key, threshold, rows, hf_token = args
+    repo_id = f"{HF_ORG}/BabyBabel-{lang}-{key}"
+
+    ds_dict = DatasetDict({"train": Dataset.from_list(rows)})
+    ds_dict.push_to_hub(
+        repo_id,
+        token=hf_token,
+        commit_message=(
+            f"Add BabyBabel-{lang}-{key} "
+            f"({threshold // 1_000_000}M-token slice, seed={SHUFFLE_SEED})"
+        ),
+        max_shard_size="500MB",  # keep shards manageable
+    )
+    return repo_id, len(rows)
+
+
+def push_staged(all_buffers: dict[str, dict[str, list[dict]]]):
+    """
+    Push datasets in 3 stages (small → medium → large).
+    Within each stage, PUSH_THREADS uploads run concurrently.
+    Staging keeps the upload queue predictable and makes early
+    results available sooner.
+    """
+    hf_token = os.environ.get("HF_TOKEN")
+    total_pushed = 0
+    t_start = time.time()
+
+    for stage_num, stage_keys in enumerate(PUSH_STAGES, 1):
+        stage_jobs = [
+            (lang, key, TARGETS[key], all_buffers[lang][key], hf_token)
+            for lang in all_buffers
+            for key in stage_keys
+            if all_buffers[lang].get(key)
+        ]
+
+        if not stage_jobs:
+            continue
+
+        total_rows = sum(len(j[3]) for j in stage_jobs)
+        print(
+            f"\n  Stage {stage_num}/{len(PUSH_STAGES)}  "
+            f"targets={stage_keys}  "
+            f"repos={len(stage_jobs)}  "
+            f"rows={total_rows:,}  "
+            f"threads={PUSH_THREADS}"
+        )
+        t_stage = time.time()
+
+        with ThreadPoolExecutor(max_workers=PUSH_THREADS) as executor:
+            futures = {executor.submit(_push_one, job): job for job in stage_jobs}
+            for future in tqdm(as_completed(futures), total=len(futures),
+                               desc=f"  stage {stage_num}", unit="repo"):
+                job = futures[future]
+                lang, key = job[0], job[1]
+                try:
+                    repo_id, n_rows = future.result()
+                    total_pushed += 1
+                    tqdm.write(f"  ✓  {repo_id}  ({n_rows:,} rows)")
+                except Exception as exc:
+                    tqdm.write(f"  ✗  BabyBabel-{lang}-{key}: {exc}")
+
+        stage_elapsed = time.time() - t_stage
+        print(f"  Stage {stage_num} done in {stage_elapsed/60:.1f} min")
+
+    total_elapsed = time.time() - t_start
+    print(f"\n  All {total_pushed} repos pushed in {total_elapsed/60:.1f} min total")
 
 
 # ── Orchestration ─────────────────────────────────────────────────────────────
@@ -233,40 +325,49 @@ def main():
             "make sure you are logged in via `huggingface-cli login`\n"
         )
 
-    # 1. Download all languages concurrently ───────────────────────────────────
-    print(f"Step 1/4  Downloading {len(SOURCES)} datasets concurrently ...")
-    all_data = download_all()
-    total_rows = sum(len(v) for v in all_data.values())
-    print(f"\n  Total rows: {total_rows:,}  |  Workers: {NUM_WORKERS}\n")
+    print(
+        f"Config\n"
+        f"  Languages      : {list(SOURCES)}\n"
+        f"  Targets        : {list(TARGETS)}  ({len(TARGETS)} thresholds)\n"
+        f"  Max repos      : {len(SOURCES) * len(TARGETS)}\n"
+        f"  CPU workers    : {NUM_WORKERS}\n"
+        f"  Batch size     : {BATCH_SIZE:,} rows\n"
+        f"  Shuffle seed   : {SHUFFLE_SEED}\n"
+        f"  Upload threads : {PUSH_THREADS} per stage\n"
+        f"  Push stages    : {PUSH_STAGES}\n"
+    )
 
-    # 2. Tokenise with a single persistent pool ────────────────────────────────
-    print(f"Step 2/4  Tokenising ({NUM_WORKERS} workers, batch={BATCH_SIZE:,}) ...")
-    with mp.Pool(processes=NUM_WORKERS) as pool:
-        token_counts = tokenize_all(all_data, pool)
+    # ── Step 1+2 — Stream, tokenize, slice ────────────────────────────────────
+    print("Step 1+2/4  Stream → tokenize → slice  (single persistent pool)\n")
+    t0 = time.time()
 
-    lang_totals = {lang: sum(tc) for lang, tc in token_counts.items()}
-    grand_total = sum(lang_totals.values())
-    print(f"\n  Corpus total: {grand_total:,} tokens")
-    for lang, n in sorted(lang_totals.items(), key=lambda kv: -kv[1]):
-        can_hit = [k for k, t in TARGETS.items() if n >= t]
-        hits = ", ".join(can_hit) if can_hit else "none (below 33M)"
-        print(f"    {lang}: {n:>14,} tok  →  targets reachable: {hits}")
+    with mp.Pool(processes=NUM_WORKERS, initializer=_init_worker) as pool:
+        all_buffers: dict[str, dict[str, list[dict]]] = {}
+        for lang, ds_id in SOURCES.items():
+            tqdm.write(f"\n  [{lang}]  {ds_id}")
+            all_buffers[lang] = process_language(lang, ds_id, pool)
 
-    # 3. Slice each language independently ─────────────────────────────────────
-    print("\nStep 3/4  Slicing per language ...")
-    all_buffers: dict[str, dict[str, list[dict]]] = {}
-    for lang, rows in all_data.items():
-        all_buffers[lang] = slice_language(rows, token_counts[lang])
-        sizes = {k: len(v) for k, v in all_buffers[lang].items()}
-        print(f"  {lang}: " + "  ".join(f"{k}M→{v:,}rows" for k, v in sizes.items()))
+    tok_elapsed = time.time() - t0
+    print(f"\n  Tokenize+slice done in {tok_elapsed/60:.1f} min")
 
-    # 4. Push all 27 datasets concurrently ─────────────────────────────────────
-    print("\nStep 4/4  Pushing to HuggingFace ...")
-    push_all(all_buffers)
+    # Summary table
+    print("\n  Row counts per language × target:")
+    print(f"  {'lang':<6}" + "".join(f"{k:>8}" for k in TARGETS))
+    for lang in SOURCES:
+        row_counts = [len(all_buffers[lang].get(k, [])) for k in TARGETS]
+        print(f"  {lang:<6}" + "".join(f"{n:>8,}" for n in row_counts))
+
+    # ── Step 3 — Pre-create all repos ─────────────────────────────────────────
+    print("\nStep 3/4  Pre-creating all repos in parallel ...")
+    precreate_all_repos(all_buffers)
+
+    # ── Step 4 — Staged push ──────────────────────────────────────────────────
+    print("\nStep 4/4  Staged push to HuggingFace ...")
+    push_staged(all_buffers)
 
     print("\nAll done!")
 
 
 if __name__ == "__main__":
-    mp.set_start_method("spawn", force=True)  # safe on macOS/Windows/Linux
+    mp.set_start_method("spawn", force=True)
     main()
