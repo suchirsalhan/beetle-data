@@ -31,9 +31,8 @@ from pathlib import Path
 # ── optional tokenisers ────────────────────────────────────────────────────────
 
 def build_tokenizer(name: str):
-    """Return a callable: str → list[str | int]."""
     if name == "whitespace":
-        return str.split          # built-in, zero deps
+        return str.split
 
     if name == "tiktoken":
         try:
@@ -57,105 +56,108 @@ def build_tokenizer(name: str):
 # ── core streaming generator ───────────────────────────────────────────────────
 
 def token_stream(path: Path, tokenize, chunk_bytes: int = 65_536):
-    """
-    Lazily yield tokens from *path* in read-order.
-    Reads the file in byte-chunks and handles words that straddle chunk
-    boundaries by carrying a leftover buffer.
-    """
     leftover = ""
     with path.open("r", encoding="utf-8", errors="replace") as fh:
         while True:
             raw = fh.read(chunk_bytes)
             if not raw:
                 break
-            # split on the last whitespace so we don't cut a word in half
             block = leftover + raw
             cut = block.rfind(" ")
             if cut == -1:
-                leftover = block          # no space found yet — keep buffering
+                leftover = block
                 continue
             chunk_text = block[:cut]
             leftover   = block[cut + 1:]
             yield from tokenize(chunk_text)
 
-        # flush whatever is still in the buffer
         if leftover.strip():
             yield from tokenize(leftover)
 
 
 def stream_n_tokens(path: Path, target: int, tokenize, chunk_bytes: int = 65_536):
-    """
-    Yield up to *target* tokens from *path*, looping over the file if needed.
-    """
     yielded = 0
-    for token in itertools.cycle([None]):   # outer loop = file passes
-        _ = token                           # suppress lint warning
-        gen = token_stream(path, tokenize, chunk_bytes)
-        for tok in gen:
+    for _ in itertools.cycle([None]):
+        for tok in token_stream(path, tokenize, chunk_bytes):
             yield tok
             yielded += 1
             if yielded >= target:
                 return
 
 
-# ── progress reporter ──────────────────────────────────────────────────────────
+# ── main run ───────────────────────────────────────────────────────────────────
 
 def run(args):
-    path   = Path(args.file)
-    target = args.target
-    tok_fn = build_tokenizer(args.tokenizer)
+    path        = Path(args.file)
+    target      = args.target
+    tok_fn      = build_tokenizer(args.tokenizer)
+    output_path = Path(args.output)
 
     if not path.exists():
         sys.exit(f"File not found: {path}")
 
-    print(f"Streaming {target:,} tokens from '{path}'  "
-          f"(tokeniser: {args.tokenizer}, chunk: {args.chunk:,} bytes)")
+    # ensure ./stream/ directory exists
+    output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    report_every = max(1, target // 100)   # progress every ~1 %
-    t0 = t_last = time.perf_counter()
-    count = 0
+    print(f"Streaming {target:,} tokens from '{path}'")
+    print(f"Saving output to '{output_path}'")
+    print(f"Tokeniser: {args.tokenizer}  |  Chunk: {args.chunk:,} bytes\n")
+
+    report_every      = max(1, target // 100)
+    write_buffer      = []
+    write_buffer_size = 100_000
+    t0 = t_last       = time.perf_counter()
+    count             = 0
     tokens_since_last = 0
 
-    for tok in stream_n_tokens(path, target, tok_fn, args.chunk):
-        count += 1
-        tokens_since_last += 1
+    with output_path.open("w", encoding="utf-8") as out_fh:
+        for tok in stream_n_tokens(path, target, tok_fn, args.chunk):
+            write_buffer.append(str(tok))
+            count += 1
+            tokens_since_last += 1
 
-        if args.verbose:
-            print(tok)                     # print every token (very slow!)
+            if len(write_buffer) >= write_buffer_size:
+                out_fh.write("\n".join(write_buffer) + "\n")
+                write_buffer.clear()
 
-        if count % report_every == 0 or count == target:
-            now  = time.perf_counter()
-            rate = tokens_since_last / max(1e-9, now - t_last)
-            pct  = 100 * count / target
-            elapsed = now - t0
-            eta = (target - count) / max(1, rate)
-            print(f"  {pct:6.2f}%  {count:>14,} / {target:,} tokens  "
-                  f"  {rate:,.0f} tok/s  "
-                  f"  elapsed {elapsed:,.1f}s  ETA {eta:,.1f}s",
-                  flush=True)
-            t_last = now
-            tokens_since_last = 0
+            if count % report_every == 0 or count == target:
+                now     = time.perf_counter()
+                rate    = tokens_since_last / max(1e-9, now - t_last)
+                pct     = 100 * count / target
+                elapsed = now - t0
+                eta     = (target - count) / max(1, rate)
+                print(f"  {pct:6.2f}%  {count:>14,} / {target:,} tokens  "
+                      f"  {rate:,.0f} tok/s  "
+                      f"  elapsed {elapsed:,.1f}s  ETA {eta:,.1f}s",
+                      flush=True)
+                t_last = now
+                tokens_since_last = 0
+
+        if write_buffer:
+            out_fh.write("\n".join(write_buffer) + "\n")
 
     elapsed = time.perf_counter() - t0
-    print(f"\nDone. Streamed {count:,} tokens in {elapsed:.2f}s  "
+    size_mb = output_path.stat().st_size / 1_048_576
+    print(f"\nDone. Streamed {count:,} tokens in {elapsed:.2f}s "
           f"({count/elapsed:,.0f} tok/s avg).")
+    print(f"Output saved to: {output_path}  ({size_mb:.1f} MB)")
 
 
 # ── CLI ────────────────────────────────────────────────────────────────────────
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Stream 33.33 M tokens from a text file.")
-    p.add_argument("--file",       default="kidlm.txt",
+    p = argparse.ArgumentParser(description="Stream 33.33M tokens from a text file.")
+    p.add_argument("--file",      default="kidlm.txt",
                    help="Path to source text file (default: kidlm.txt)")
-    p.add_argument("--target",     type=int, default=33_330_000,
+    p.add_argument("--target",    type=int, default=33_330_000,
                    help="Number of tokens to stream (default: 33_330_000)")
-    p.add_argument("--chunk",      type=int, default=65_536,
+    p.add_argument("--chunk",     type=int, default=65_536,
                    help="Read-buffer size in bytes (default: 65536)")
-    p.add_argument("--tokenizer",  default="whitespace",
+    p.add_argument("--tokenizer", default="whitespace",
                    choices=["whitespace", "tiktoken", "hf"],
                    help="Tokenisation strategy (default: whitespace)")
-    p.add_argument("--verbose",    action="store_true",
-                   help="Print every token (warning: very slow)")
+    p.add_argument("--output",    default="./stream/output.txt",
+                   help="Path to save streamed tokens (default: ./stream/output.txt)")
     return p.parse_args()
 
 
