@@ -22,7 +22,7 @@ OUT_DIR.mkdir(exist_ok=True)
 # 1. DATA GENERATOR
 # =====================================================
 def get_training_corpus():
-    zh_ds = load_dataset"HuggingFaceFW/fineweb-2", name="cmn_Hani",, split="train", streaming=True)
+    zh_ds = load_dataset("HuggingFaceFW/fineweb-2", name="cmn_Hani", split="train", streaming=True)
     en_ds = load_dataset("HuggingFaceFW/fineweb-edu", split="train", streaming=True)
 
     zh_iter, en_iter = iter(zh_ds), iter(en_ds)
