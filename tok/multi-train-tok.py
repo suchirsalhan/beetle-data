@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """
-Multi-language Byte-Level BPE Tokenizer
-========================================
+Multi-language Tokenizer Trainer
+==================================
 Script : train_tokenizer_multi.py
-Model  : Byte-Level BPE
 Data   : FineWeb-2 (language-specific) + FineWeb-edu (English)
 Target : HuggingFace Hub → {HF_USER}/tokenizer-{LANG}-en
 
@@ -13,47 +12,64 @@ Supported languages
   fr  French      de  German       it  Italian     eu  Basque
   tr  Turkish     id  Indonesian   tl  Tagalog     fa  Persian
   hi  Hindi       ta  Tamil        sv  Swedish     ru  Russian
-  ca  Catalan
+  ca  Catalan     ar  Arabic       zh  Chinese
+
+Models used
+-----------
+  Byte-Level BPE (18 languages)
+    pl nl es fr de it sv ca eu tr id tl el ru fa hi ta zh
+    - ByteLevel converts every input character to its raw UTF-8 byte sequence
+      before tokenisation, so the 256-byte initial alphabet guarantees ZERO
+      unknown tokens regardless of script (Cyrillic, Greek, Devanagari, Tamil,
+      CJK …)
+    - BPE merges then learn high-frequency byte-pair combinations, building up
+      from individual bytes to full words/morphemes.
+
+  Unigram + SentencePiece (1 language)
+    ar  Arabic
+    - Arabic's root-and-pattern morphology and clitic system are better served
+      by Unigram's global probabilistic segmentation than greedy BPE merges.
+    - UnicodeScripts pre-tokenizer cleanly separates Arabic from Latin/digits
+      at script boundaries — critical for Arabic-English code-switching.
+    - Metaspace encodes spaces as ▁ for lossless round-trips.
+    - Byte-Level BPE would waste vocab slots on byte-pair noise (each Arabic
+      letter = 2 UTF-8 bytes) instead of learning meaningful morphemes.
+
+Key per-language normalisation decisions
+-----------------------------------------
+  ALL BPE langs : NFKC (except zh → NFC, ar/fa → NFKC+tatweel)
+    - Collapses Unicode Compatibility forms (full-width digits, presentation
+      block glyphs, ligatures) into canonical base characters.
+    - Safe for all Latin/Cyrillic/Greek/Indic scripts — does NOT remove
+      meaningful diacritics.
+
+  Chinese (zh)  : NFC (not NFKC)
+    - NFKC decomposes CJK Compatibility Ideographs (U+F900–U+FAFF) into their
+      canonical equivalents, collapsing variants that can differ in meaning
+      across CJK standards. NFC is the safer choice for Chinese.
+
+  Persian (fa) &
+  Arabic  (ar)  : NFKC + strip tatweel (U+0640)
+    - Tatweel is a calligraphic letter-stretcher with zero linguistic content.
+    - Arabic Presentation Forms (FE block) in older web text are normalised to
+      canonical forms by NFKC.
+    - For Persian: ZWNJ (U+200C) is intentionally PRESERVED — it distinguishes
+      word-internal morpheme boundaries (می‌روم vs میروم).
+    - For Arabic: Alef-hamza variants (أ/إ/آ) and tashkeel (diacritics) are
+      intentionally NOT normalised — they carry morphological meaning.
+
+  All other langs: NFKC only — diacritics in Polish, Turkish, Swedish, etc.
+    are phonemically distinct and must NEVER be stripped.
 
 Usage
 -----
   python train_tokenizer_multi.py --lang pl
-  python train_tokenizer_multi.py --lang fa --vocab-size 60000
-  python train_tokenizer_multi.py --lang hi --hf-user MyOrg --sentences 3000000
-  python train_tokenizer_multi.py --lang ta --no-push   # local only
-
-Why Byte-Level BPE across all 17 languages?
---------------------------------------------
-  - ByteLevel converts every input character to its raw UTF-8 byte sequence
-    before tokenisation, so the 256-byte initial alphabet guarantees ZERO
-    unknown tokens regardless of script (Cyrillic, Greek, Devanagari, Tamil …)
-  - BPE merges then learn high-frequency byte-pair combinations, building up
-    from individual bytes to full words/morphemes.
-  - Works for space-delimited (European) and morphologically rich (Turkish,
-    Finnish-type) languages alike.
-  - Language-specific tuning lives entirely in the NORMALIZER layer (below),
-    not in the BPE algorithm itself.
-
-Key per-language normalisation decisions
------------------------------------------
-  ALL langs   : NFKC
-    - Collapses Unicode Compatibility forms (full-width digits, presentation
-      block glyphs, ligatures) into canonical base characters.
-    - Safe for all 17 languages — does NOT remove meaningful diacritics.
-
-  Persian (fa): NFKC + strip tatweel (U+0640)
-    - Tatweel is a calligraphic letter-stretcher with zero linguistic content.
-    - Arabic Presentation Forms (FE block) common in older Persian web text
-      are normalised to canonical forms by NFKC.
-    - ZWNJ (U+200C) is intentionally PRESERVED — it distinguishes word-internal
-      morpheme boundaries in Persian (می‌روم vs میروم).
-
-  All others  : NFKC only — diacritics in Polish, Turkish, Swedish, etc.
-    are phonemically distinct and must NEVER be stripped.
+  python train_tokenizer_multi.py --lang ar --vocab-size 60000
+  python train_tokenizer_multi.py --lang zh --hf-user MyOrg --sentences 1000000
+  python train_tokenizer_multi.py --lang hi --no-push   # local only
 """
 
 import os
-import sys
 import argparse
 from pathlib import Path
 
@@ -73,11 +89,18 @@ from huggingface_hub import create_repo
 # =====================================================
 # LANGUAGE CONFIGS
 # =====================================================
-# fw2_name   : FineWeb-2 subset name (FLORES-200 code)
-# normalizer : "nfkc" | "nfkc+tatweel"
-# min_freq   : BPE min_frequency; lower for smaller corpora
-# notes      : tokenisation decisions specific to this language
-# test_cases : benchmark strings in (name → text) order
+# fw2_name             : FineWeb-2 subset name (FLORES-200 code)
+# model                : "bpe" (default) | "unigram"  — tokenizer algorithm
+# normalizer           : "nfc" | "nfkc" | "nfkc+tatweel"
+# add_prefix_space     : bool — ByteLevel only; True for zh (GPT-2 style)
+# trim_offsets         : bool — ByteLevel post-processor; True for zh
+# clean_up_spaces      : bool — passed to PreTrainedTokenizerFast; True for zh
+# min_freq             : BPE min_frequency; lower for smaller corpora (BPE only)
+# shrinking_factor     : Unigram EM pruning fraction per round (Unigram only)
+# max_piece_length     : Unigram max sub-word length in chars (Unigram only)
+# n_sub_iterations     : Unigram EM steps per pruning round (Unigram only)
+# notes                : tokenisation decisions specific to this language
+# test_cases           : benchmark strings as {name: text}
 
 LANG_CONFIGS: dict = {
 
@@ -89,6 +112,7 @@ LANG_CONFIGS: dict = {
         "name"      : "Polish",
         "fw2_name"  : "pol_Latn",
         "script"    : "Latin",
+        "model"     : "bpe",
         "normalizer": "nfkc",
         "min_freq"  : 2,
         "notes": [
@@ -109,6 +133,7 @@ LANG_CONFIGS: dict = {
         "name"      : "Dutch",
         "fw2_name"  : "nld_Latn",
         "script"    : "Latin",
+        "model"     : "bpe",
         "normalizer": "nfkc",
         "min_freq"  : 2,
         "notes": [
@@ -127,6 +152,7 @@ LANG_CONFIGS: dict = {
         "name"      : "Spanish",
         "fw2_name"  : "spa_Latn",
         "script"    : "Latin",
+        "model"     : "bpe",
         "normalizer": "nfkc",
         "min_freq"  : 2,
         "notes": [
@@ -145,6 +171,7 @@ LANG_CONFIGS: dict = {
         "name"      : "French",
         "fw2_name"  : "fra_Latn",
         "script"    : "Latin",
+        "model"     : "bpe",
         "normalizer": "nfkc",
         "min_freq"  : 2,
         "notes": [
@@ -163,6 +190,7 @@ LANG_CONFIGS: dict = {
         "name"      : "German",
         "fw2_name"  : "deu_Latn",
         "script"    : "Latin",
+        "model"     : "bpe",
         "normalizer": "nfkc",
         "min_freq"  : 2,
         "notes": [
@@ -172,10 +200,10 @@ LANG_CONFIGS: dict = {
             "Consider vocab_size 60k–80k for German to cover compound fragments.",
         ],
         "test_cases": {
-            "DE_Simple"   : "Hallo, wie geht es Ihnen?",
-            "DE_Umlauts"  : "Über die Größe des Brötchens lässt sich streiten.",
-            "DE_Compound" : "Das Donaudampfschifffahrtsgesellschaftskapitänspatent.",
-            "DE_Mixed"    : "Wir nutzen maschinelles Lernen für NLP-Aufgaben.",
+            "DE_Simple"  : "Hallo, wie geht es Ihnen?",
+            "DE_Umlauts" : "Über die Größe des Brötchens lässt sich streiten.",
+            "DE_Compound": "Das Donaudampfschifffahrtsgesellschaftskapitänspatent.",
+            "DE_Mixed"   : "Wir nutzen maschinelles Lernen für NLP-Aufgaben.",
         },
     },
 
@@ -183,6 +211,7 @@ LANG_CONFIGS: dict = {
         "name"      : "Italian",
         "fw2_name"  : "ita_Latn",
         "script"    : "Latin",
+        "model"     : "bpe",
         "normalizer": "nfkc",
         "min_freq"  : 2,
         "notes": [
@@ -200,6 +229,7 @@ LANG_CONFIGS: dict = {
         "name"      : "Swedish",
         "fw2_name"  : "swe_Latn",
         "script"    : "Latin",
+        "model"     : "bpe",
         "normalizer": "nfkc",
         "min_freq"  : 2,
         "notes": [
@@ -219,6 +249,7 @@ LANG_CONFIGS: dict = {
         "name"      : "Catalan",
         "fw2_name"  : "cat_Latn",
         "script"    : "Latin",
+        "model"     : "bpe",
         "normalizer": "nfkc",
         "min_freq"  : 2,
         "notes": [
@@ -241,6 +272,7 @@ LANG_CONFIGS: dict = {
         "name"      : "Basque",
         "fw2_name"  : "eus_Latn",
         "script"    : "Latin",
+        "model"     : "bpe",
         "normalizer": "nfkc",
         "min_freq"  : 1,   # lower-resource: min_freq=1 to preserve rare morphemes
         "notes": [
@@ -260,6 +292,7 @@ LANG_CONFIGS: dict = {
         "name"      : "Turkish",
         "fw2_name"  : "tur_Latn",
         "script"    : "Latin",
+        "model"     : "bpe",
         "normalizer": "nfkc",
         "min_freq"  : 2,
         "notes": [
@@ -269,10 +302,10 @@ LANG_CONFIGS: dict = {
             "BPE learns common suffixes (-lar/-ler, -da/-de, -ın/-in, -sız/-siz).",
         ],
         "test_cases": {
-            "TR_Simple"      : "Merhaba, nasılsınız?",
+            "TR_Simple"       : "Merhaba, nasılsınız?",
             "TR_Agglutinative": "Çekoslovakyalılaştıramadıklarımızdanmışsınız.",
-            "TR_DottedI"     : "İstanbul ve Izmir büyük şehirlerdir.",
-            "TR_Mixed"       : "Python kullanarak doğal dil işleme yapıyoruz.",
+            "TR_DottedI"      : "İstanbul ve Izmir büyük şehirlerdir.",
+            "TR_Mixed"        : "Python kullanarak doğal dil işleme yapıyoruz.",
         },
     },
 
@@ -280,6 +313,7 @@ LANG_CONFIGS: dict = {
         "name"      : "Indonesian",
         "fw2_name"  : "ind_Latn",
         "script"    : "Latin",
+        "model"     : "bpe",
         "normalizer": "nfkc",
         "min_freq"  : 2,
         "notes": [
@@ -298,6 +332,7 @@ LANG_CONFIGS: dict = {
         "name"      : "Tagalog",
         "fw2_name"  : "tgl_Latn",
         "script"    : "Latin",
+        "model"     : "bpe",
         "normalizer": "nfkc",
         "min_freq"  : 1,   # lower-resource; keep rare affixes
         "notes": [
@@ -321,6 +356,7 @@ LANG_CONFIGS: dict = {
         "name"      : "Greek",
         "fw2_name"  : "ell_Grek",
         "script"    : "Greek",
+        "model"     : "bpe",
         "normalizer": "nfkc",
         "min_freq"  : 2,
         "notes": [
@@ -341,6 +377,7 @@ LANG_CONFIGS: dict = {
         "name"      : "Russian",
         "fw2_name"  : "rus_Cyrl",
         "script"    : "Cyrillic",
+        "model"     : "bpe",
         "normalizer": "nfkc",
         "min_freq"  : 2,
         "notes": [
@@ -358,13 +395,87 @@ LANG_CONFIGS: dict = {
     },
 
     # --------------------------------------------------
+    # NON-LATIN SCRIPTS — EAST ASIAN
+    # --------------------------------------------------
+
+    "zh": {
+        "name"            : "Chinese",
+        "fw2_name"        : "cmn_Hani",
+        "script"          : "Han",
+        "model"           : "bpe",
+        "normalizer"      : "nfc",       # NFC, not NFKC — see notes
+        "add_prefix_space": True,        # GPT-2 convention; no negative effect on CJK
+        "trim_offsets"    : True,        # paired with add_prefix_space for consistent offsets
+        "clean_up_spaces" : True,
+        "min_freq"        : 2,
+        "notes": [
+            "Mandarin Chinese (Simplified + Traditional); Han script.",
+            "CJK Unified Ideographs span U+4E00–U+9FFF + extension blocks; each = 3 bytes in UTF-8.",
+            "NFC chosen over NFKC: NFKC decomposes CJK Compatibility Ideographs",
+            "  (U+F900–U+FAFF) collapsing variants treated as distinct chars in",
+            "  some CJK standards (e.g. JIS vs GB). NFC is safer for Chinese.",
+            "add_prefix_space=True: GPT-2/ByteLevel convention marking string starts",
+            "  with Ġ; has no negative effect on Chinese (no whitespace assumptions).",
+            "trim_offsets=True: paired with add_prefix_space for consistent offset mapping.",
+            "No word boundaries in Chinese — BPE learns character n-gram merges.",
+            "50k vocab usually sufficient; consider 60k–80k for classical/literary text.",
+        ],
+        "test_cases": {
+            "ZH_Simple"  : "你好，我饿了。",
+            "ZH_Long"    : "人工智能技术正在改变我们的生活方式。",
+            "ZH_Mixed"   : "Hello 你好!",
+            "ZH_Numbers" : "这本书的价格是299元。",
+        },
+    },
+
+    # --------------------------------------------------
     # NON-LATIN SCRIPTS — MIDDLE EAST / SOUTH ASIA
     # --------------------------------------------------
+
+    "ar": {
+        "name"            : "Arabic",
+        "fw2_name"        : "arb_Arab",   # Modern Standard Arabic
+        "script"          : "Arabic",
+        "model"           : "unigram",    # ← Unigram, NOT BPE; see notes
+        "normalizer"      : "nfkc+tatweel",
+        "clean_up_spaces" : False,        # Metaspace decoder owns spacing
+        # UnigramTrainer hyperparameters
+        "shrinking_factor": 0.75,         # fraction of vocab kept per EM pruning round
+        "max_piece_length": 20,           # covers long clitic-stacked Arabic words
+        "n_sub_iterations": 2,            # EM steps per pruning round
+        "notes": [
+            "Modern Standard Arabic; Arabic script (U+0600–U+06FF).",
+            "Each Arabic letter = 2 bytes in UTF-8.",
+            "Uses Unigram (not BPE): Arabic's root-and-pattern morphology and clitic",
+            "  system (و/ب/ك/ل prefixes + ه/ها/هم suffixes) are better modelled by",
+            "  global probabilistic segmentation than greedy BPE merges.",
+            "  ByteLevel BPE would learn byte-pair noise ((0xD8,0xB9)→ع) instead of",
+            "  meaningful morphemes; ~2× more tokens per Arabic word than Unigram.",
+            "NFKC collapses Arabic Presentation Forms (U+FE70–FEFF) → canonical chars.",
+            "STRIP tatweel (U+0640): calligraphic letter-stretcher; zero linguistic value.",
+            "Alef-hamza variants (أ/إ/آ/ا) intentionally NOT normalised — hamza",
+            "  position carries morphological meaning; normalising harms quality.",
+            "Diacritics (tashkeel) intentionally NOT stripped — rare in web text but",
+            "  essential for diacritized religious/classical Arabic text.",
+            "UnicodeScripts pre-tokenizer splits Arabic from Latin/digits at script",
+            "  boundaries — critical for Arabic-English code-switching in web data.",
+            "Metaspace encodes spaces as ▁ for lossless round-trips.",
+        ],
+        "test_cases": {
+            "AR_Simple"     : "مرحباً، أنا جائع.",
+            "AR_Clitics"    : "وسيكتبونها في التقرير.",
+            "AR_Diacritized": "بِسْمِ اللَّهِ الرَّحْمَٰنِ الرَّحِيمِ",
+            "AR_Tatweel"    : "كتـــاب",   # tatweel stripped → same tokens as كتاب
+            "AR_Numerals"   : "السعر هو ١٢٬٠٠٠ ريال.",
+            "AR_EN_Mixed"   : "نستخدم Python لتطوير نماذج الذكاء الاصطناعي.",
+        },
+    },
 
     "fa": {
         "name"      : "Persian",
         "fw2_name"  : "pes_Arab",   # Western Persian (Farsi), Arabic script
         "script"    : "Arabic",
+        "model"     : "bpe",
         "normalizer": "nfkc+tatweel",
         "min_freq"  : 2,
         "notes": [
@@ -377,10 +488,10 @@ LANG_CONFIGS: dict = {
             "Persian uses spaces between words more consistently than Arabic.",
         ],
         "test_cases": {
-            "FA_Simple"  : "سلام، حال شما چطور است؟",
-            "FA_ZWNJ"    : "می‌روم به مدرسه هر روز صبح.",
-            "FA_Tatweel" : "کتـــاب",   # tatweel stripped → same tokens as کتاب
-            "FA_Mixed"   : "ما از Python برای یادگیری ماشین استفاده می‌کنیم.",
+            "FA_Simple" : "سلام، حال شما چطور است؟",
+            "FA_ZWNJ"   : "می‌روم به مدرسه هر روز صبح.",
+            "FA_Tatweel": "کتـــاب",   # tatweel stripped → same tokens as کتاب
+            "FA_Mixed"  : "ما از Python برای یادگیری ماشین استفاده می‌کنیم.",
         },
     },
 
@@ -388,6 +499,7 @@ LANG_CONFIGS: dict = {
         "name"      : "Hindi",
         "fw2_name"  : "hin_Deva",
         "script"    : "Devanagari",
+        "model"     : "bpe",
         "normalizer": "nfkc",
         "min_freq"  : 2,
         "notes": [
@@ -408,6 +520,7 @@ LANG_CONFIGS: dict = {
         "name"      : "Tamil",
         "fw2_name"  : "tam_Taml",
         "script"    : "Tamil",
+        "model"     : "bpe",
         "normalizer": "nfkc",
         "min_freq"  : 2,
         "notes": [
@@ -425,25 +538,27 @@ LANG_CONFIGS: dict = {
 
 }
 
-# Languages with smaller FineWeb-2 corpora; reduce sentences if streaming stalls.
+# Languages with smaller FineWeb-2 corpora; reduce --sentences if streaming stalls.
 LOWER_RESOURCE_LANGS = {"eu", "tl", "ta"}
 
 # =====================================================
 # CLI
 # =====================================================
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Train a Byte-Level BPE tokenizer for one of 17 languages.")
-    p.add_argument("--lang",        required=True,  choices=sorted(LANG_CONFIGS),
+    p = argparse.ArgumentParser(
+        description="Train a tokenizer for one of 19 languages (BPE or Unigram)."
+    )
+    p.add_argument("--lang",       required=True, choices=sorted(LANG_CONFIGS),
                    help="ISO-639-1 language code.")
-    p.add_argument("--hf-user",     default="RA-ALTA",
+    p.add_argument("--hf-user",    default="RA-ALTA",
                    help="HuggingFace username / org (default: RA-ALTA).")
-    p.add_argument("--vocab-size",  type=int, default=50_000,
-                   help="BPE vocabulary size (default: 50000).")
-    p.add_argument("--sentences",   type=int, default=2_000_000,
+    p.add_argument("--vocab-size", type=int, default=50_000,
+                   help="Vocabulary size (default: 50000).")
+    p.add_argument("--sentences",  type=int, default=2_000_000,
                    help="Total training sentences, split 50/50 lang/EN (default: 2M).")
-    p.add_argument("--no-push",     action="store_true",
+    p.add_argument("--no-push",    action="store_true",
                    help="Skip HuggingFace Hub push.")
-    p.add_argument("--out-dir",     default=None,
+    p.add_argument("--out-dir",    default=None,
                    help="Local output directory (default: tokenizer-{lang}-local).")
     return p.parse_args()
 
@@ -488,17 +603,23 @@ def build_normalizer(norm_type: str):
     """
     Returns the tokenizers normalizer for the given type string.
 
-    "nfkc"          → NFKC only (safe for all Latin/Cyrillic/Greek/Indic scripts)
-    "nfkc+tatweel"  → NFKC then strip U+0640 (for Arabic-script languages: fa)
+    "nfc"           → NFC only
+                      Chinese: avoids NFKC's CJK Compatibility Ideograph collapse.
+    "nfkc"          → NFKC only
+                      Safe for all Latin/Cyrillic/Greek/Indic scripts.
+    "nfkc+tatweel"  → NFKC then strip U+0640
+                      For Arabic-script languages (ar, fa): removes the
+                      calligraphic kashida stretcher that carries no meaning.
     """
-    if norm_type == "nfkc":
+    if norm_type == "nfc":
+        return normalizers.NFC()
+    elif norm_type == "nfkc":
         return normalizers.NFKC()
     elif norm_type == "nfkc+tatweel":
         return normalizers.Sequence([
             normalizers.NFKC(),
-            # Tatweel (kashida) U+0640 — calligraphic letter-stretcher; no meaning.
-            # Appears frequently in Persian/Arabic web text. Strip before training
-            # so "کتـاب" and "کتاب" map to identical token sequences.
+            # Strip tatweel (U+0640) — calligraphic letter-stretcher; no meaning.
+            # "كتـاب" and "كتاب" must map to identical token sequences.
             normalizers.Replace(pattern="\u0640", content=""),
         ])
     else:
@@ -509,73 +630,137 @@ def build_normalizer(norm_type: str):
 # =====================================================
 def build_tokenizer(cfg: dict) -> Tokenizer:
     """
-    Assembles the full tokenizer pipeline.
+    Assembles the full tokenizer pipeline based on the language config.
 
-    Pipeline
-    --------
-    Normalizer  → language-specific (see build_normalizer)
-    Pre-tokenizer → ByteLevel(add_prefix_space=False)
+    BPE pipeline (18 languages — all except Arabic)
+    -------------------------------------------------
+    Normalizer    → language-specific (see build_normalizer)
+    Pre-tokenizer → ByteLevel(add_prefix_space=False by default, True for zh)
       - Converts every character to its raw UTF-8 bytes before BPE
-      - 256-byte alphabet guarantees zero unknown tokens for ALL scripts
+      - 256-byte initial alphabet guarantees zero unknown tokens for ALL scripts
       - add_prefix_space=False: avoids spurious leading Ġ for non-English text
-    BPE model
-    Post-processor → ByteLevel(trim_offsets=False)
-      - Ensures offset mappings are consistent with ByteLevel encoding
-    Decoder → ByteLevel
+        (True for Chinese to match GPT-2 convention)
+    Post-processor → ByteLevel(trim_offsets=False by default, True for zh)
+      - Ensures offset mappings are consistent with the ByteLevel encoding
+    Decoder       → ByteLevel
       - Converts byte sequences back to Unicode strings on decode
-    """
-    tokenizer = Tokenizer(models.BPE())
 
-    tokenizer.normalizer    = build_normalizer(cfg["normalizer"])
-    tokenizer.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
-    tokenizer.post_processor = processors.ByteLevel(trim_offsets=False)
-    tokenizer.decoder       = decoders.ByteLevel()
+    Unigram pipeline (Arabic only)
+    --------------------------------
+    Normalizer    → NFKC + strip tatweel (U+0640)
+    Pre-tokenizer → Sequence([UnicodeScripts, Metaspace(▁, add_prefix_space=True)])
+      - UnicodeScripts: splits Arabic from Latin/digits at script boundaries,
+        enabling clean Arabic-English code-switching
+      - Metaspace: SentencePiece-style space encoding for lossless round-trips
+    Decoder       → Metaspace
+      - Reverses ▁ markers back to spaces on decode
+    (No post-processor needed for Unigram/Metaspace)
+    """
+    model_type = cfg.get("model", "bpe")
+
+    if model_type == "bpe":
+        tokenizer = Tokenizer(models.BPE())
+        tokenizer.normalizer     = build_normalizer(cfg["normalizer"])
+        tokenizer.pre_tokenizer  = pre_tokenizers.ByteLevel(
+            add_prefix_space=cfg.get("add_prefix_space", False)
+        )
+        tokenizer.post_processor = processors.ByteLevel(
+            trim_offsets=cfg.get("trim_offsets", False)
+        )
+        tokenizer.decoder        = decoders.ByteLevel()
+
+    elif model_type == "unigram":
+        tokenizer = Tokenizer(models.Unigram())
+        tokenizer.normalizer    = build_normalizer(cfg["normalizer"])
+        tokenizer.pre_tokenizer = pre_tokenizers.Sequence([
+            pre_tokenizers.UnicodeScripts(),          # split Arabic / Latin / digits
+            pre_tokenizers.Metaspace(                 # SentencePiece-style space-as-▁
+                replacement="▁",
+                add_prefix_space=True,
+            ),
+        ])
+        tokenizer.decoder = decoders.Metaspace()
+
+    else:
+        raise ValueError(f"Unknown model type: {model_type!r}")
 
     return tokenizer
 
 # =====================================================
-# 4. TRAIN & PUSH
+# 4. BUILD TRAINER
+# =====================================================
+def build_trainer(cfg: dict, vocab_size: int):
+    """
+    Returns the appropriate trainer for the language's model type.
+
+    BPE    → BpeTrainer with the full 256-byte initial alphabet, ensuring
+             every byte of every script is representable before any merges.
+    Unigram → UnigramTrainer with Arabic-tuned hyperparameters:
+             - max_piece_length=20 covers long clitic-stacked Arabic words
+               e.g. "وَسَيَكْتُبُونَهَا" (18 chars + diacritics)
+             - shrinking_factor=0.75 (default) is a safe EM pruning rate
+             - n_sub_iterations=2 is the standard EM step count per round
+    """
+    model_type = cfg.get("model", "bpe")
+
+    if model_type == "bpe":
+        return trainers.BpeTrainer(
+            vocab_size       = vocab_size,
+            min_frequency    = cfg["min_freq"],
+            special_tokens   = ["<unk>", "<s>", "</s>", "<pad>"],
+            # Include all 256 possible byte values in the initial alphabet.
+            # Ensures every script's bytes are in the vocab before any merges,
+            # making OOV tokens structurally impossible for any Unicode input.
+            initial_alphabet = pre_tokenizers.ByteLevel.alphabet(),
+        )
+
+    elif model_type == "unigram":
+        return trainers.UnigramTrainer(
+            vocab_size       = vocab_size,
+            special_tokens   = ["<unk>", "<s>", "</s>", "<pad>"],
+            unk_token        = "<unk>",
+            shrinking_factor = cfg.get("shrinking_factor", 0.75),
+            max_piece_length = cfg.get("max_piece_length", 16),
+            n_sub_iterations = cfg.get("n_sub_iterations", 2),
+        )
+
+    else:
+        raise ValueError(f"Unknown model type: {model_type!r}")
+
+# =====================================================
+# 5. TRAIN & PUSH
 # =====================================================
 def train_and_push(
-    lang      : str,
-    hf_user   : str,
-    vocab_size: int,
+    lang       : str,
+    hf_user    : str,
+    vocab_size : int,
     n_sentences: int,
-    out_dir   : Path,
-    push      : bool,
+    out_dir    : Path,
+    push       : bool,
 ):
-    cfg     = LANG_CONFIGS[lang]
-    repo_id = f"{hf_user}/tokenizer-{lang}-en"
-    hf_token = os.environ.get("HF_TOKEN")
+    cfg        = LANG_CONFIGS[lang]
+    repo_id    = f"{hf_user}/tokenizer-{lang}-en"
+    hf_token   = os.environ.get("HF_TOKEN")
+    model_type = cfg.get("model", "bpe")
 
     print(f"\n{'='*60}")
     print(f" Language : {cfg['name']} ({lang})")
     print(f" Script   : {cfg['script']}")
+    print(f" Model    : {model_type.upper()}")
     print(f" FW2 name : {cfg['fw2_name']}")
     print(f" Vocab    : {vocab_size:,}")
     print(f" Sentences: {n_sentences:,}")
     print(f" Repo     : {repo_id}")
     print(f"{'='*60}\n")
 
-    # Print language-specific notes
     for note in cfg["notes"]:
         print(f"  ℹ  {note}")
     print()
 
     tokenizer = build_tokenizer(cfg)
+    trainer   = build_trainer(cfg, vocab_size)
 
-    trainer = trainers.BpeTrainer(
-        vocab_size       = vocab_size,
-        min_frequency    = cfg["min_freq"],
-        special_tokens   = ["<unk>", "<s>", "</s>", "<pad>"],
-        # Include all 256 possible byte values in the initial alphabet.
-        # This ensures that even rare scripts (Tamil, Devanagari, Cyrillic …)
-        # have their component bytes in the vocab before any merges happen,
-        # making OOV tokens structurally impossible.
-        initial_alphabet = pre_tokenizers.ByteLevel.alphabet(),
-    )
-
-    print(f"🚀 Training Byte-Level BPE …")
+    print(f"🚀 Training {model_type.upper()} tokenizer …")
     tokenizer.train_from_iterator(
         get_training_corpus(cfg, n_sentences),
         trainer=trainer,
@@ -583,13 +768,14 @@ def train_and_push(
 
     # ---- Wrap in HF PreTrainedTokenizerFast ----
     hf_tokenizer = PreTrainedTokenizerFast(
-        tokenizer_object            = tokenizer,
-        bos_token                   = "<s>",
-        eos_token                   = "</s>",
-        pad_token                   = "<pad>",
-        unk_token                   = "<unk>",
-        # ByteLevel decoder owns spacing; HF must not add its own cleanup
-        clean_up_tokenization_spaces = False,
+        tokenizer_object             = tokenizer,
+        bos_token                    = "<s>",
+        eos_token                    = "</s>",
+        pad_token                    = "<pad>",
+        unk_token                    = "<unk>",
+        # False for most languages: ByteLevel/Metaspace decoders own spacing.
+        # True for Chinese: matches GPT-2 convention set by add_prefix_space=True.
+        clean_up_tokenization_spaces = cfg.get("clean_up_spaces", False),
     )
 
     hf_tokenizer.save_pretrained(out_dir)
@@ -604,34 +790,37 @@ def train_and_push(
         print(f"✅ Pushed → https://huggingface.co/{repo_id}")
 
 # =====================================================
-# 5. BENCHMARK
+# 6. BENCHMARK
 # =====================================================
 def run_benchmark(lang: str, out_dir: Path):
     """
-    Tests tokenisation correctness and token-efficiency for:
-      - Language-specific cases (diacritics, morphology, script stress tests)
-      - English (verifies bilingual sub-word learning)
-      - Mixed language + code-switching
-      - Emoji (ByteLevel must handle 4-byte UTF-8 emoji)
+    Tests tokenisation correctness and token-efficiency.
 
     Checks:
-      1. Round-trip losslessness  : decode(encode(text)).strip() == text.strip()
-         For Persian + tatweel: decoded text will not contain tatweel (correct).
-      2. Token-efficiency ratio   : tokens / chars  (lower = better compression)
+      1. Round-trip losslessness: decode(encode(text)).strip() == text.strip()
+         For languages with normalizer "nfkc+tatweel" (ar, fa): decoded text
+         will not contain tatweel (U+0640) — this is correct normaliser
+         behaviour, so the expected string is computed with tatweel removed.
+      2. Token-efficiency ratio: tokens / chars  (lower = better compression)
+
+    Shared cases (appended for every language):
+      - EN_Simple : English sentence — verifies bilingual sub-word learning
+      - Emoji     : 4-byte UTF-8 emoji — ByteLevel/Unigram must handle without OOV
     """
     cfg = LANG_CONFIGS[lang]
     tk  = AutoTokenizer.from_pretrained(out_dir)
 
     print(f"\n🧪 Benchmark — {cfg['name']} ({lang})\n" + "─" * 60)
 
-    # Shared cases added to every language
     shared_cases = {
         "EN_Simple": "The quick brown fox jumps over the lazy dog.",
         "Emoji"    : "Learning is fun! 🚀🔥",
     }
+    all_cases = {**cfg["test_cases"], **shared_cases}
 
-    all_cases  = {**cfg["test_cases"], **shared_cases}
-    all_passed = True
+    # Languages whose normaliser strips tatweel — expected decode won't contain U+0640
+    strips_tatweel = cfg["normalizer"] == "nfkc+tatweel"
+    all_passed     = True
 
     for name, text in all_cases.items():
         tokens  = tk.encode(text)
@@ -640,8 +829,7 @@ def run_benchmark(lang: str, out_dir: Path):
         n_chr   = len(text)
         ratio   = n_tok / n_chr
 
-        # For tatweel test: normaliser strips U+0640 so decoded won't contain it
-        expected = text.replace("\u0640", "") if lang == "fa" else text
+        expected = text.replace("\u0640", "") if strips_tatweel else text
         ok       = decoded.strip() == expected.strip()
         status   = "✅" if ok else "❌ MISMATCH"
         if not ok:
@@ -658,13 +846,16 @@ def run_benchmark(lang: str, out_dir: Path):
     print(marker)
 
 # =====================================================
-# 6. VOCAB INSPECTION
+# 7. VOCAB INSPECTION
 # =====================================================
 def inspect_vocab(lang: str, out_dir: Path, n: int = 50):
     """
     Sample the learned vocabulary.
-    For non-Latin scripts look for target-language tokens (not just bytes).
-    For agglutinative languages (tr, eu, fi-like) look for suffix tokens.
+
+    For non-Latin scripts: look for target-language tokens (not just raw bytes).
+    For agglutinative languages (tr, eu, id, tl, ta): look for affix tokens.
+    For Arabic (Unigram): look for prefix tokens (ال، وال، بال) and root fragments.
+    For Chinese (BPE): look for CJK character merges and character bigrams.
     """
     cfg   = LANG_CONFIGS[lang]
     tk    = AutoTokenizer.from_pretrained(out_dir)
