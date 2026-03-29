@@ -571,12 +571,11 @@ def get_training_corpus(cfg: dict, n_sentences: int):
     Both datasets are streamed — no local disk required.
     """
     lang_ds = load_dataset(
-        "HuggingFaceFW/fineweb-2",
-        name=cfg["fw2_name"],
-        split="train",
-        streaming=True,
-        trust_remote_code=True,
-    )
+      "HuggingFaceFW/fineweb-2",
+      name=cfg["fw2_name"],
+      split="train",
+      streaming=True,
+  )
     en_ds = load_dataset(
         "HuggingFaceFW/fineweb-edu",
         split="train",
