@@ -26,12 +26,12 @@ accelerate>=0.30.0
 
 # Optional but recommended for large-scale streaming / training
 aiohttp>=3.9.0          # async dataset streaming backend
-fsspec>=2024.2.0       # filesystem abstraction (used by datasets)
-psutil>=5.9.0          # memory monitoring
-tqdm>=4.66.0           # progress bars
+fsspec>=2024.2.0        # filesystem abstraction (used by datasets)
+psutil>=5.9.0           # memory monitoring
+tqdm>=4.66.0            # progress bars
 
 # =====================================================
 # Optional (only if scaling further)
 # =====================================================
-# deepspeed>=0.14.0     # if you later train models (not needed for tokenizer only)
-# wandb>=0.16.0         # experiment tracking
+# deepspeed>=0.14.0      # for model training (not needed for tokenizer)
+# wandb>=0.16.0          # experiment tracking
