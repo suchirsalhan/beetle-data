@@ -550,7 +550,7 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--lang",       required=True, choices=sorted(LANG_CONFIGS),
                    help="ISO-639-1 language code.")
-    p.add_argument("--hf-user",    default="RA-ALTA",
+    p.add_argument("--hf-user",    default="Beetle-Data",
                    help="HuggingFace username / org (default: RA-ALTA).")
     p.add_argument("--vocab-size", type=int, default=50_000,
                    help="Vocabulary size (default: 50000).")
