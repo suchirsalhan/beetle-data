@@ -55,7 +55,7 @@ LANG_CONFIGS = {
         "name": "Arabic", "fw2_name": "arb_Arab", "model": "unigram", "norm": "nfkc+tatweel", 
         "clean_up_spaces": False, "shrinking_factor": 0.75, "max_piece_length": 20
     },
-    "fa": {"name": "Persian", "fw2_name": "pes_Arab", "model": "bpe", "norm": "nfkc+tatweel", "min_freq": 2},
+    "fa": {"name": "Persian", "fw2_name": "fas_Arab", "model": "bpe", "norm": "nfkc+tatweel", "min_freq": 2},
     "hi": {"name": "Hindi", "fw2_name": "hin_Deva", "model": "bpe", "norm": "nfkc", "min_freq": 2},
     "ta": {"name": "Tamil", "fw2_name": "tam_Taml", "model": "bpe", "norm": "nfkc", "min_freq": 2},
 }
