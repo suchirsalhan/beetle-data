@@ -25,7 +25,7 @@ for LANG in "${LANGS[@]}"; do
   echo "🚀 Training tokenizer for $LANG"
   echo "======================================="
 
-  python ./tok/multi-train-tok.py \
+  python multi-train-tok.py \
     --lang "$LANG" \
     --hf-user "$HF_USER" \
     --vocab-size "$VOCAB_SIZE" \
@@ -42,7 +42,7 @@ echo "======================================="
 echo "🚀 Training tokenizer for JA"
 echo "======================================="
 
-python ./tok/ja-en-tok.py \
+python ja-en-tok.py \
   --hf-user "$HF_USER" \
   --vocab-size "$VOCAB_SIZE" \
   --sentences "$SENTENCES" \
