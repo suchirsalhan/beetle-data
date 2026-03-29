@@ -44,7 +44,7 @@ LANG_CONFIGS = {
     "eu": {"name": "Basque", "fw2_name": "eus_Latn", "model": "bpe", "norm": "nfkc", "min_freq": 1},
     "tr": {"name": "Turkish", "fw2_name": "tur_Latn", "model": "bpe", "norm": "nfkc", "min_freq": 2},
     "id": {"name": "Indonesian", "fw2_name": "ind_Latn", "model": "bpe", "norm": "nfkc", "min_freq": 2},
-    "tl": {"name": "Tagalog", "fw2_name": "tgl_Latn", "model": "bpe", "norm": "nfkc", "min_freq": 1},
+    "tl": {"name": "Tagalog", "fw2_name": "fil_Latn", "model": "bpe", "norm": "nfkc", "min_freq": 1},
     "el": {"name": "Greek", "fw2_name": "ell_Grek", "model": "bpe", "norm": "nfkc", "min_freq": 2},
     "ru": {"name": "Russian", "fw2_name": "rus_Cyrl", "model": "bpe", "norm": "nfkc", "min_freq": 2},
     "zh": {
