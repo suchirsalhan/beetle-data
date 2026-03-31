@@ -4,6 +4,19 @@
 datasets>=2.18.0
 pyarrow>=14.0.0
 numpy>=1.24
+pandas>=2.0
+tqdm>=4.65
+ftfy>=6.1
+
+
+# Language detection
+langdetect>=1.0.9
+langid>=1.1.6
+ 
+# ML / embeddings (for trained regressor)
+scikit-learn>=1.3
+sentence-transformers>=2.2   # for embeddings (optional but recommended)
+ 
 
 # =====================================================
 # Tokenization & Model Handling
@@ -35,3 +48,8 @@ tqdm>=4.66.0            # progress bars
 # =====================================================
 # deepspeed>=0.14.0      # for model training (not needed for tokenizer)
 # wandb>=0.16.0          # experiment tracking
+
+
+# Deep learning (optional — for LLM annotation)
+# torch>=2.0
+# transformers>=4.35
