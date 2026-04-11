@@ -83,7 +83,10 @@ cd beetle-data
 bash scripts/launch_full_pipeline.sh
 
 # Specific languages only
-bash scripts/launch_full_pipeline.sh --lang pl nl es
+bash scripts/launch_full_pipeline.sh --lang fr de es zh ja
+bash scripts/launch_full_pipeline.sh --lang nl it ru pl tr
+bash scripts/launch_full_pipeline.sh --lang tl hi ta eu ar
+bash scripts/launch_full_pipeline.sh --lang sv el ca fa id
 
 # Custom output directory (e.g., on an SSD mount with more space)
 OUTPUT_DIR=/mnt/ssd-3/beetle-data bash scripts/launch_full_pipeline.sh
