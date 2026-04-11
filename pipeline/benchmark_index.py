@@ -146,12 +146,11 @@ def _load_hf_texts(bdef: BenchmarkDef) -> List[str]:
             configs = [None]
         for cfg in configs:
             try:
-                ds = load_dataset(bdef.hf_id, cfg, split=bdef.split,
-                                  trust_remote_code=True)
+                ds = load_dataset(bdef.hf_id, cfg, split=bdef.split)
             except Exception:
                 # Some splits may not exist for all configs
                 try:
-                    ds = load_dataset(bdef.hf_id, cfg, trust_remote_code=True)
+                    ds = load_dataset(bdef.hf_id, cfg)
                     # Take first available split
                     split_name = list(ds.keys())[0]
                     ds = ds[split_name]
@@ -167,12 +166,10 @@ def _load_hf_texts(bdef: BenchmarkDef) -> List[str]:
         # Load per-language configs
         for lang_key, lang_name in (bdef.lang_configs or {}).items():
             try:
-                ds = load_dataset(bdef.hf_id, lang_key, split=bdef.split,
-                                  trust_remote_code=True)
+                ds = load_dataset(bdef.hf_id, lang_key, split=bdef.split)
             except Exception:
                 try:
-                    ds = load_dataset(bdef.hf_id, lang_name, split=bdef.split,
-                                      trust_remote_code=True)
+                    ds = load_dataset(bdef.hf_id, lang_name, split=bdef.split)
                 except Exception as e:
                     log.warning("  Skipping %s/%s: %s", bdef.hf_id, lang_key, e)
                     continue
@@ -185,12 +182,10 @@ def _load_hf_texts(bdef: BenchmarkDef) -> List[str]:
         # Each language has its own split/config name
         for lang_key, split_name in (bdef.lang_configs or {}).items():
             try:
-                ds = load_dataset(bdef.hf_id, split_name, split=bdef.split,
-                                  trust_remote_code=True)
+                ds = load_dataset(bdef.hf_id, split_name, split=bdef.split)
             except Exception:
                 try:
-                    ds = load_dataset(bdef.hf_id, split=split_name,
-                                      trust_remote_code=True)
+                    ds = load_dataset(bdef.hf_id, split=split_name)
                 except Exception as e:
                     log.warning("  Skipping %s/%s: %s", bdef.hf_id, split_name, e)
                     continue
@@ -204,7 +199,7 @@ def _load_hf_texts(bdef: BenchmarkDef) -> List[str]:
         # label 1 = grammatical (good), label 0 = ungrammatical (bad)
         # We extract ALL sentences (both good and bad) for decontamination
         try:
-            ds = load_dataset(bdef.hf_id, split=bdef.split, trust_remote_code=True)
+            ds = load_dataset(bdef.hf_id, split=bdef.split)
             # Try common column name patterns for CLiMP
             for col_name in ds.column_names:
                 col_data = ds[col_name]
@@ -236,9 +231,9 @@ def _load_hf_texts(bdef: BenchmarkDef) -> List[str]:
 
     # Default: single config, single split
     try:
-        ds = load_dataset(bdef.hf_id, split=bdef.split, trust_remote_code=True)
+        ds = load_dataset(bdef.hf_id, split=bdef.split)
     except Exception:
-        ds = load_dataset(bdef.hf_id, trust_remote_code=True)
+        ds = load_dataset(bdef.hf_id)
         split_name = list(ds.keys())[0]
         ds = ds[split_name]
     for col in bdef.text_columns:
@@ -300,8 +295,7 @@ def _load_ud_treebank_texts() -> List[str]:
         for tb in treebanks:
             for split in ["train", "validation", "test"]:
                 try:
-                    ds = load_dataset("universal_dependencies", tb, split=split,
-                                      trust_remote_code=True)
+                    ds = load_dataset("universal_dependencies", tb, split=split)
                     for row in ds:
                         text = row.get("text", "")
                         if isinstance(text, str) and text.strip():

@@ -1,0 +1,27 @@
+# Ignore large data folders
+strict/
+strict-small/
+stream/
+
+# Ignore specific large files
+*.txt
+
+# But keep small / important text if needed
+!README.md
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# OS / misc
+.DS_Store

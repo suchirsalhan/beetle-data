@@ -101,6 +101,28 @@ bash scripts/launch_extensions.sh
 bash scripts/launch_low_resource.sh
 ```
 
+### Smoke Test (Local CPU, ~10 min)
+
+Run a minimal end-to-end check before launching large-scale jobs. This exercises all three stages with tiny data volumes — no GPU, no HF upload, and minimal disk needed.
+
+```bash
+# Stage 1: Build the full benchmark index (~5 min)
+python -m pipeline.run_pipeline --stage 1 --project-root .
+
+# Stage 2: Decontaminate a tiny sample for one language (~2 min)
+python -m pipeline.run_pipeline --stage 2 --lang pl --target-words 10000 \
+  --index pipeline_output/benchmark_13gram.pkl --project-root . --num-workers 4
+
+# Stage 3: Pretokenize the small output, skip upload (~1 min)
+python -m pipeline.run_pipeline --stage 3 --lang pl --no-upload --no-cleanup \
+  --project-root . --num-workers 4
+```
+
+Expected outputs:
+- `pipeline_output/benchmark_13gram.pkl` — benchmark index
+- `pipeline_output/decontaminated/pl/*.parquet` — at least 1 Parquet shard
+- `pipeline_output/pretokenized/pl-en/` — Arrow dataset
+
 ### Run Individual Stages
 
 ```bash
