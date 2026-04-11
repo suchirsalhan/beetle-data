@@ -5,18 +5,16 @@ datasets>=2.18.0
 pyarrow>=14.0.0
 numpy>=1.24
 pandas>=2.0
-tqdm>=4.65
+tqdm>=4.66.0
 ftfy>=6.1
-
 
 # Language detection
 langdetect>=1.0.9
 langid>=1.1.6
- 
+
 # ML / embeddings (for trained regressor)
 scikit-learn>=1.3
-sentence-transformers>=2.2   # for embeddings (optional but recommended)
- 
+sentence-transformers>=2.2   # optional but recommended
 
 # =====================================================
 # Tokenization & Model Handling
@@ -37,19 +35,16 @@ huggingface_hub>=0.23.0
 # =====================================================
 accelerate>=0.30.0
 
-# Optional but recommended for large-scale streaming / training
-aiohttp>=3.9.0          # async dataset streaming backend
-fsspec>=2024.2.0        # filesystem abstraction (used by datasets)
-psutil>=5.9.0           # memory monitoring
-tqdm>=4.66.0            # progress bars
+# Async + filesystem (used by datasets streaming)
+aiohttp>=3.9.0
+fsspec>=2024.2.0
+psutil>=5.9.0
 
 # =====================================================
 # Optional (only if scaling further)
 # =====================================================
-# deepspeed>=0.14.0      # for model training (not needed for tokenizer)
+# deepspeed>=0.14.0      # large-scale training
 # wandb>=0.16.0          # experiment tracking
-
 
 # Deep learning (optional — for LLM annotation)
 # torch>=2.0
-# transformers>=4.35
