@@ -1,0 +1,39 @@
+# FineWeb Trilingual Experiments
+# 8B tokens per language (24B total per triple)
+#
+# Trilingual models combining two non-English languages with English.
+# Data source: FineWeb-Edu (English), FineWeb-2 (all other languages)
+# All pretokenized data pushed to HF org: Beetle-Data
+
+experiment: fineweb_trilingual
+description: "Trilingual models at 8B tokens per language"
+
+data:
+  source: fineweb
+  hf_org: Beetle-Data
+  seq_len: 512
+  chunk_len: 513
+
+tokenizer:
+  type: bpe
+  vocab_size: 50000
+
+scale:
+  tokens_per_language: 8_000_000_000   # 8B per language
+  total_tokens: 24_000_000_000         # 24B total per triple
+  hf_dataset_suffix: "24B"
+
+conditions:
+  - balanced
+  - simultaneous
+  - sequential
+
+# Trilingual triples (L1 + L2 + English)
+# Language triples selected for typological diversity and MECO coverage
+core_triples:
+  - { l1: nl, l2: de, l3: en }   # West Germanic cluster
+  - { l1: zh, l2: ja, l3: en }   # East Asian cluster
+  - { l1: nl, l2: zh, l3: en }   # Typologically distant
+  - { l1: es, l2: fr, l3: en }   # Romance cluster
+  - { l1: tr, l2: fa, l3: en }   # Turkic-Iranian
+  - { l1: hi, l2: ta, l3: en }   # Indic cluster

@@ -1,0 +1,61 @@
+# FineWeb Tokenizer Training Config
+# Train bilingual BPE tokenizers for all FineWeb language pairs
+#
+# Each tokenizer is trained on the combined L1 + English data.
+# Tokenizers are pushed to HF org: Beetle-Data
+# Naming: Beetle-Data/tokenizer-{lang}-en
+
+experiment: fineweb_tokenizer
+description: "BPE tokenizers for all FineWeb bilingual pairs"
+
+tokenizer:
+  type: bpe
+  vocab_size: 50000
+  naming_pattern: "Beetle-Data/tokenizer-{lang}-en"
+  push_to_hub: true
+  hf_org: Beetle-Data
+
+# All languages needing tokenizers (paired with English)
+# Core languages are trained first; extension and low-resource follow
+core_languages:
+  - pl
+  - nl
+  - es
+  - el
+  - ja
+  - fr
+  - zh
+  - de
+  - it
+  - eu
+  - tr
+  - id
+  - tl
+  - fa
+  - hi
+  - ta
+  - sv
+  - ru
+  - ca
+  - ar
+
+extension_languages:
+  - ur
+  - bn
+  - cs
+  - gu
+  - th
+  - vi
+  - ko
+  - da
+
+low_resource_languages:
+  - hu
+  - bg
+  - hr
+  - uk
+  - sl
+  - so
+  - am
+  - yo
+  - wo

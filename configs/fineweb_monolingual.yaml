@@ -1,0 +1,73 @@
+# FineWeb Monolingual Baselines
+# 24B tokens per language, single-language pretraining
+#
+# These configs produce monolingual baselines for comparison with
+# bilingual/trilingual models. Each language is trained independently.
+#
+# Data source: FineWeb-Edu (English), FineWeb-2 (all other languages)
+# All pretokenized data pushed to HF org: Beetle-Data
+
+experiment: fineweb_monolingual
+description: "Monolingual baselines at 24B tokens per language"
+
+data:
+  source: fineweb
+  hf_org: Beetle-Data
+  seq_len: 512
+  chunk_len: 513  # seq_len + 1
+
+tokenizer:
+  type: bpe
+  vocab_size: 50000
+  naming_pattern: "Beetle-Data/tokenizer-{lang}-en"
+
+scale:
+  tokens_per_language: 24_000_000_000
+  hf_dataset_suffix: "24B"
+
+# Core languages (highest priority)
+core_languages:
+  - pl  # Polish
+  - nl  # Dutch
+  - es  # Spanish
+  - el  # Greek
+  - ja  # Japanese
+  - fr  # French
+  - zh  # Chinese
+  - de  # German
+  - it  # Italian
+  - eu  # Basque
+  - tr  # Turkish
+  - id  # Indonesian
+  - tl  # Tagalog
+  - fa  # Persian
+  - hi  # Hindi
+  - ta  # Tamil
+  - sv  # Swedish
+  - ru  # Russian
+  - ca  # Catalan
+  - ar  # Arabic
+  - en  # English
+
+# Extension languages (lower priority, separate pipeline runs)
+extension_languages:
+  - ur  # Urdu
+  - bn  # Bengali
+  - cs  # Czech
+  - gu  # Gujarati
+  - th  # Thai
+  - vi  # Vietnamese
+  - ko  # Korean
+  - da  # Danish
+
+# Low-resource languages (lowest priority, may not reach full token count)
+low_resource_languages:
+  - hu  # Hungarian
+  - bg  # Bulgarian
+  - hr  # Croatian
+  - uk  # Ukrainian
+  - sl  # Slovenian
+  - so  # Somali
+  - am  # Amharic
+  - yo  # Yoruba
+  - wo  # Wolof

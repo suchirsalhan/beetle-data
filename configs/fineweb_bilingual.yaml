@@ -1,0 +1,90 @@
+# FineWeb Bilingual Experiments
+# 12B tokens per language (50:50 L1:EN split, 24B total per pair)
+#
+# Each non-English language is paired with English for bilingual pretraining.
+# Three training conditions are applied in BeetleLM:
+#   - balanced: 100% L1 first 50%, then 50:50 L1:L2
+#   - simultaneous: 50:50 throughout, alternating L1:L2 epochs
+#   - sequential: late introduction of L2
+#
+# Data source: FineWeb-Edu (English), FineWeb-2 (all other languages)
+# All pretokenized data pushed to HF org: Beetle-Data
+
+experiment: fineweb_bilingual
+description: "Bilingual L1-English models at 12B tokens per language (50:50 split)"
+
+data:
+  source: fineweb
+  hf_org: Beetle-Data
+  seq_len: 512
+  chunk_len: 513
+  l1_ratio: 0.5   # 50:50 split
+  en_ratio: 0.5
+
+tokenizer:
+  type: bpe
+  vocab_size: 50000
+  naming_pattern: "Beetle-Data/tokenizer-{lang}-en"
+
+scale:
+  tokens_per_language: 12_000_000_000  # 12B per language
+  total_tokens: 24_000_000_000         # 24B total per pair
+  hf_dataset_suffix: "24B"
+
+conditions:
+  - balanced       # L1 first 50%, then 50:50
+  - simultaneous   # 50:50 alternating throughout
+  - sequential     # Late L2 introduction
+
+# EWC/MAML/LR settings: use best combination from human-scale sweep
+# (to be filled in after human-scale experiments)
+continual_learning:
+  ewc_lambda: null   # TBD from sweep
+  maml_hybrid_ratio: null
+  lr_boost: null
+
+# Core L1-English pairs (highest priority)
+core_pairs:
+  - { l1: pl, l2: en }
+  - { l1: nl, l2: en }
+  - { l1: es, l2: en }
+  - { l1: el, l2: en }
+  - { l1: ja, l2: en }
+  - { l1: fr, l2: en }
+  - { l1: zh, l2: en }
+  - { l1: de, l2: en }
+  - { l1: it, l2: en }
+  - { l1: eu, l2: en }
+  - { l1: tr, l2: en }
+  - { l1: id, l2: en }
+  - { l1: tl, l2: en }
+  - { l1: fa, l2: en }
+  - { l1: hi, l2: en }
+  - { l1: ta, l2: en }
+  - { l1: sv, l2: en }
+  - { l1: ru, l2: en }
+  - { l1: ca, l2: en }
+  - { l1: ar, l2: en }
+
+# Extension pairs (lower priority)
+extension_pairs:
+  - { l1: ur, l2: en }
+  - { l1: bn, l2: en }
+  - { l1: cs, l2: en }
+  - { l1: gu, l2: en }
+  - { l1: th, l2: en }
+  - { l1: vi, l2: en }
+  - { l1: ko, l2: en }
+  - { l1: da, l2: en }
+
+# Low-resource pairs (lowest priority, may not reach full token count)
+low_resource_pairs:
+  - { l1: hu, l2: en }
+  - { l1: bg, l2: en }
+  - { l1: hr, l2: en }
+  - { l1: uk, l2: en }
+  - { l1: sl, l2: en }
+  - { l1: so, l2: en }
+  - { l1: am, l2: en }
+  - { l1: yo, l2: en }
+  - { l1: wo, l2: en }
