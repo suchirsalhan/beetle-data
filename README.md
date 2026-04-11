@@ -67,7 +67,8 @@ All evaluation data is indexed as 13-grams. Any training document containing a 1
 ### Prerequisites
 
 ```bash
-pip install datasets transformers tokenizers pyarrow pandas tqdm huggingface_hub
+python3 -m venv venvs/demo; source venvs/demo/bin/activate
+pip install -r requirements.txt
 export HF_TOKEN=<your-token>
 ```
 
