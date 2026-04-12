@@ -1,6 +1,6 @@
 # Beetle-Data
 
-Modular large-scale preprocessing library for streaming, decontaminating, and pretokenizing multilingual training data. Produces Arrow datasets compatible with the [BeetleLM](../beetlelm) training framework.
+Modular large-scale preprocessing library for streaming, decontaminating, and pretokenizing multilingual training data. Produces Arrow datasets compatible with the [BeetleLM](../beetlelm) training framework. Also supports streaming held-out evaluation data for [learning curve analysis](../beetle-analyze/aoa/).
 
 ## Overview
 
@@ -18,6 +18,16 @@ HF benchmarks              FineWeb-2 / FineWeb-Edu         Clean Parquet
     v                           v                               v
 13-gram index (.pkl)       Clean Parquet shards            Arrow datasets
                            + manifest.json                 (beetlelm-compatible)
+
+                           Stage 4 (optional)
+                           Held-Out Streaming
+                           (~10 min per language)
+
+                           FineWeb-2 (beyond training cutoff)
+                               |
+                               v
+                           Held-out Parquet shards
+                           (for learning curve eval)
 ```
 
 Stages are decoupled so you can re-run pretokenization when a tokenizer changes without re-streaming 560B tokens, or re-run decontamination against new benchmarks without re-tokenizing.
@@ -197,6 +207,27 @@ python -m pipeline.run_pipeline --stage 2 3 --node-id 0 \
 python -m pipeline.run_pipeline --lang pl --no-upload --no-cleanup
 ```
 
+### Stream Held-Out Evaluation Data (Stage 4)
+
+Streams FineWeb-2 documents **beyond the training cutoff** for use in learning curve analysis (Chang & Bergen, 2024). Reads `docs_streamed` from training stats to ensure no overlap with training data.
+
+```bash
+# Stream 10,000 held-out documents for German
+python -m pipeline.stream_held_out --lang de --output-dir pipeline_output --n-docs 10000
+
+# Stream for multiple languages
+for lang in de nl ja zh es ru; do
+    python -m pipeline.stream_held_out --lang $lang --output-dir pipeline_output --n-docs 10000
+done
+
+# Custom document count
+python -m pipeline.stream_held_out --lang ja --output-dir pipeline_output --n-docs 50000
+```
+
+Output: `pipeline_output/held_out/{lang}/*.parquet` + `{lang}_held_out_stats.json`
+
+The held-out data is consumed by `beetle-analyze/aoa/prepare_eval_data.py` for constructing evaluation sequences that are guaranteed unseen during training.
+
 ### Verify Output
 
 ```bash
@@ -241,6 +272,9 @@ pipeline_output/
   pretokenized/
     pl/                         # Arrow (~64 GB, deleted after HF upload)
     en_for_pl/                  # Arrow (~32 GB, deleted after HF upload)
+  held_out/
+    de/                         # Held-out Parquet shards (for learning curve eval)
+    nl/                         # ... one directory per language
 ```
 
 ### Stage 2 Parquet Format
@@ -362,6 +396,7 @@ beetle-data/
     benchmark_index.py         # Stage 1: Build 13-gram index from benchmarks
     decontaminate_stream.py    # Stage 2: Stream + decontaminate + write Parquet
     pretokenize_arrow.py       # Stage 3: Tokenize + pack + write Arrow
+    stream_held_out.py         # Stage 4: Stream held-out data beyond training cutoff
     post_hoc.py                # Post-hoc contamination analysis
     run_pipeline.py            # CLI orchestrator
   configs/
