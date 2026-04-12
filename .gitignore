@@ -2,12 +2,13 @@
 strict/
 strict-small/
 stream/
+pipeline_output/
 
-# Ignore specific large files
-*.txt
+# Large generated artifacts
+pipeline_output/
 
-# But keep small / important text if needed
-!README.md
+# Optional: only ignore specific txt outputs, not all txt
+# *.txt  <-- remove unless you really want this
 
 # Python
 __pycache__/
