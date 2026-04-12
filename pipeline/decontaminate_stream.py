@@ -341,6 +341,10 @@ def decontaminate_language(
 
     pbar.close()
 
+    # Clean up the streaming dataset iterator to avoid orphaned httpx/aiohttp
+    # background threads that cause PyGILState_Release crashes during shutdown.
+    del ds
+
     # Finalize
     writer.finalize()
     manifest_path = writer.save_manifest()

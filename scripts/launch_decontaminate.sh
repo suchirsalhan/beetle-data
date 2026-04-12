@@ -28,8 +28,9 @@
 set -euo pipefail
 
 # ── Config ──────────────────────────────────────────────────────────────────
-PROJECT_ROOT="${PROJECT_ROOT:-/path/to/PHD}"
-BEETLE_DATA="${PROJECT_ROOT}/beetle-data"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+BEETLE_DATA="$(cd "$SCRIPT_DIR/.." && pwd)"
+PROJECT_ROOT="${PROJECT_ROOT:-$(cd "$BEETLE_DATA/.." && pwd)}"
 OUTPUT_DIR="${OUTPUT_DIR:-/mnt/ssd-3/beetle-data}"
 INDEX_PATH="${OUTPUT_DIR}/benchmark_13gram.pkl"
 HF_USER="${HF_USER:-Beetle-Data}"

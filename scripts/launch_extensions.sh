@@ -15,8 +15,9 @@
 
 set -euo pipefail
 
-PROJECT_ROOT="${PROJECT_ROOT:-$(cd "$(dirname "$0")/../.." && pwd)}"
-BEETLE_DATA="${PROJECT_ROOT}/beetle-data"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+BEETLE_DATA="$(cd "$SCRIPT_DIR/.." && pwd)"
+PROJECT_ROOT="${PROJECT_ROOT:-$(cd "$BEETLE_DATA/.." && pwd)}"
 OUTPUT_DIR="${OUTPUT_DIR:-${BEETLE_DATA}/pipeline_output}"
 HF_USER="${HF_USER:-Beetle-Data}"
 NUM_WORKERS="${NUM_WORKERS:-24}"
@@ -24,6 +25,11 @@ NUM_WORKERS="${NUM_WORKERS:-24}"
 EXTENSION_LANGS=("ur" "bn" "cs" "gu" "th" "vi" "ko" "da")
 
 cd "$BEETLE_DATA"
+
+# Activate virtual environment if it exists
+if [ -f "venvs/demo/bin/activate" ]; then
+    source venvs/demo/bin/activate
+fi
 
 echo "============================================================"
 echo "Beetle-Data Pipeline: Extension Languages"

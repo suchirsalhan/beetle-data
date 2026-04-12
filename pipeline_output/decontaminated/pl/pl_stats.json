@@ -1,0 +1,12 @@
+{
+  "lang": "pl",
+  "docs_streamed": 4000,
+  "docs_too_short": 0,
+  "docs_too_long": 8,
+  "docs_contaminated": 0,
+  "docs_clean": 3992,
+  "contamination_rate": 0.0,
+  "words_accumulated": 2274502,
+  "shards_written": 1,
+  "wall_time_sec": 15.6
+}

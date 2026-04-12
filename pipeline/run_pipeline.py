@@ -224,6 +224,8 @@ Examples:
                         help="Keep all local files (no deletion after upload)")
     parser.add_argument("--dataset-suffix", type=str, default="24B",
                         help="HF dataset repo suffix (default: 24B)")
+    parser.add_argument("--skip-disk-check", action="store_true",
+                        help="Skip the 300 GB disk space pre-flight check (for smoke tests)")
 
     args = parser.parse_args()
 
@@ -261,7 +263,7 @@ Examples:
         cfg.benchmark_index_path = str(Path(args.output_dir) / "benchmark_13gram.pkl")
 
     # Pre-flight disk check
-    if not check_disk_space(args.output_dir, required_gb=300):
+    if not args.skip_disk_check and not check_disk_space(args.output_dir, required_gb=300):
         log.error("Insufficient disk space. Need at least 300 GB free.")
         sys.exit(1)
 
@@ -310,3 +312,7 @@ Examples:
 
 if __name__ == "__main__":
     main()
+    # Force-exit to avoid PyGILState_Release crash from orphaned httpx/aiohttp
+    # background threads left by HuggingFace datasets streaming iterators.
+    import os
+    os._exit(0)

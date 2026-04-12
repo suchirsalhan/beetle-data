@@ -501,6 +501,8 @@ def pretokenize_pair(
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def main():
+    global ARROW_FLUSH_CHUNKS
+
     parser = argparse.ArgumentParser(
         description="Stage 3: Read clean Parquet, tokenize, write Arrow."
     )
@@ -531,7 +533,6 @@ def main():
     args = parser.parse_args()
 
     # Update global flush threshold
-    global ARROW_FLUSH_CHUNKS
     ARROW_FLUSH_CHUNKS = args.flush_chunks
 
     # Determine languages

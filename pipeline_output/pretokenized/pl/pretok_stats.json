@@ -1,0 +1,11 @@
+{
+  "lang": "pl",
+  "side": "l1",
+  "docs_processed": 4000,
+  "tokens_total": 3896711,
+  "chunks_created": 5754,
+  "tokens_discarded": 944909,
+  "shards_read": 1,
+  "arrow_parts_written": 1,
+  "wall_time_sec": 4.5
+}

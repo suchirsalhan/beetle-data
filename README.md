@@ -107,15 +107,16 @@ Run a minimal end-to-end check before launching large-scale jobs. This exercises
 
 ```bash
 # Stage 1: Build the full benchmark index (~5 min)
-python -m pipeline.run_pipeline --stage 1 --project-root .
+python -m pipeline.run_pipeline --stage 1 --project-root . --skip-disk-check
 
 # Stage 2: Decontaminate a tiny sample for one language (~2 min)
 python -m pipeline.run_pipeline --stage 2 --lang pl --target-words 10000 \
-  --index pipeline_output/benchmark_13gram.pkl --project-root . --num-workers 4
+  --index pipeline_output/benchmark_13gram.pkl --project-root . \
+  --num-workers 4 --skip-disk-check
 
 # Stage 3: Pretokenize the small output, skip upload (~1 min)
 python -m pipeline.run_pipeline --stage 3 --lang pl --no-upload --no-cleanup \
-  --project-root . --num-workers 4
+  --project-root . --num-workers 4 --skip-disk-check
 ```
 
 Expected outputs:
