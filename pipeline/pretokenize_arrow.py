@@ -318,9 +318,12 @@ def pretokenize_language(
     log.info("  Output: %s", arrow_dir)
     log.info("  Chunk length: %d (seq_len=%d + 1)", cfg.chunk_len, cfg.seq_len)
 
-    # Compute token target based on bilingual ratio
+    # Compute token target based on bilingual ratio.
+    # total_pair_tokens: the clean token budget for this bilingual pair.
+    # Read from cfg.target_tokens_per_lang (set in config.py TARGET_TOKENS_PER_LANG = 24B).
+    # Change TARGET_TOKENS_PER_LANG in config.py to adjust — no other code needs updating.
     if target_tokens is None:
-        total_pair_tokens = 24_000_000_000
+        total_pair_tokens = getattr(cfg, "target_tokens_per_lang", 24_000_000_000)
         if side == "l1":
             target_tokens = int(total_pair_tokens * cfg.l1_ratio)
         else:

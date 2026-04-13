@@ -49,22 +49,37 @@ log = logging.getLogger("Pipeline")
 
 
 def run_stage_1(cfg: PipelineConfig) -> str:
-    """Stage 1: Build benchmark 13-gram index."""
+    """Stage 1: Build benchmark 13-gram index.
+
+    Skips building if the index file already exists on disk. This allows
+    multiple nodes to share a single pre-built index from a shared filesystem
+    without redundantly re-building it on every node.
+    """
     from .benchmark_index import build_benchmark_index
 
+    index_path = cfg.benchmark_index_path
+
+    if Path(index_path).exists():
+        log.info("=" * 60)
+        log.info("STAGE 1: Benchmark index already exists — skipping build")
+        log.info("  Index: %s", index_path)
+        log.info("  Delete the file to force a rebuild.")
+        log.info("=" * 60)
+        return index_path
+
     log.info("=" * 60)
-    log.info("STAGE 1: Building benchmark 13-gram index")
+    log.info("STAGE 1: Building benchmark 13-gram index (MECO from HuggingFace)")
     log.info("=" * 60)
 
     t0 = time.time()
     idx = build_benchmark_index(cfg)
-    idx.save(cfg.benchmark_index_path)
+    idx.save(index_path)
     dt = time.time() - t0
 
     log.info("Stage 1 complete in %.1f min", dt / 60)
     log.info(idx.summary())
 
-    return cfg.benchmark_index_path
+    return index_path
 
 
 def run_stage_2_lang(lang: str, cfg: PipelineConfig) -> dict:
@@ -325,8 +340,14 @@ Examples:
                         help="Skip HuggingFace upload (keep local files)")
     parser.add_argument("--no-cleanup", action="store_true",
                         help="Keep all local files (no deletion after upload)")
-    parser.add_argument("--dataset-suffix", type=str, default="24B",
-                        help="HF dataset repo suffix (default: 24B)")
+    parser.add_argument("--upload-raw-parquet", action="store_true",
+                        help="Also upload raw decontaminated Parquet shards to HF "
+                             "(needed for modular curriculum D+3 runs via --curriculum-prep)")
+    parser.add_argument("--curriculum-prep", action="store_true",
+                        help="Alias for --upload-raw-parquet: prepare for later curriculum "
+                             "Stage D+3 runs by uploading raw Parquet to HuggingFace")
+    parser.add_argument("--dataset-suffix", type=str, default="28B",
+                        help="HF dataset repo suffix (default: 28B — stream token count)")
     parser.add_argument("--skip-disk-check", action="store_true",
                         help="Skip the 300 GB disk space pre-flight check (for smoke tests)")
 
@@ -354,6 +375,8 @@ Examples:
         # Default: all non-English languages (EN is handled automatically)
         languages = list(NON_EN_LANGS)
 
+    upload_raw = args.upload_raw_parquet or args.curriculum_prep
+
     # Build config
     cfg = PipelineConfig(
         project_root=args.project_root,
@@ -363,12 +386,13 @@ Examples:
         seq_len=args.seq_len,
         chunk_len=args.seq_len + 1,
         upload_to_hf=not args.no_upload,
+        upload_raw_parquet=upload_raw,
         cleanup_after_upload=not args.no_cleanup,
         cleanup_stage2_after_pretok=not args.no_cleanup,
         hf_dataset_suffix=args.dataset_suffix,
     )
     if args.target_words:
-        cfg.target_words_per_lang = args.target_words
+        cfg.stream_words_per_lang = args.target_words
 
     # Set index path
     if args.index:

@@ -1,27 +1,39 @@
 #!/bin/bash
 # =============================================================================
-# launch_full_pipeline.sh — Storage-optimized pipeline on a single node.
+# launch_full_pipeline.sh — STEP 1: Static pipeline on a single node.
 #
-# Processes languages one at a time: decontaminate → pretokenize → upload to HF
-# → delete local files. Peak disk usage stays under 300 GB.
+# Runs Stages 1+2+3 (benchmark index → decontaminate → pretokenize) for the
+# specified languages. Designed to be called once per node with a disjoint
+# language set, giving 4 parallel nodes for 20 core languages:
 #
-# Usage:
-#   # All 19 languages (default)
-#   bash scripts/launch_full_pipeline.sh
+#   Node 0:  bash scripts/launch_full_pipeline.sh --lang fr de es zh ja
+#   Node 1:  bash scripts/launch_full_pipeline.sh --lang nl it ru pl tr
+#   Node 2:  bash scripts/launch_full_pipeline.sh --lang tl hi ta eu ar
+#   Node 3:  bash scripts/launch_full_pipeline.sh --lang sv el ca fa id
 #
-#   # Specific languages
-#   bash scripts/launch_full_pipeline.sh --lang pl nl es
+# Token targets (change in pipeline/config.py to adjust):
+#   Stream:  28B clean tokens per language (≈ 21.5B whitespace words)
+#   Train:   24B tokens per bilingual pair (12B L1 + 12B EN)
 #
-#   # Without HF upload (keep local files — needs more disk)
-#   bash scripts/launch_full_pipeline.sh --lang pl --no-upload
+# Stage 1 (benchmark index) is built once by whichever node runs first.
+# All subsequent nodes skip Stage 1 if the index file already exists.
+# Requires a shared filesystem (e.g. /mnt/ssd-3) so all nodes see the index.
 #
-#   # Custom output directory (e.g., on SSD mount)
-#   OUTPUT_DIR=/mnt/ssd-3/beetle-data bash scripts/launch_full_pipeline.sh
+# Storage-optimized: processes languages one at a time, uploads each Arrow
+# dataset to HuggingFace, then deletes local files. Peak disk: ~320 GB/node.
+#
+# Options:
+#   --lang <codes>       Space-separated language codes to process (required)
+#   --no-upload          Keep local files, skip HF upload (needs ~3.5 TB/node)
+#   --curriculum-prep    Also upload raw Parquet shards to HF after Stage 2
+#                        (enables later curriculum Stage D+3 without shared FS)
+#   OUTPUT_DIR=<path>    Base output directory (default: pipeline_output)
+#   HF_USER=<org>        HuggingFace organization (default: Beetle-Data)
+#   NUM_WORKERS=<n>      Multiprocessing workers (default: 24)
 # =============================================================================
 
 set -euo pipefail
 
-# Resolve BEETLE_DATA to the directory containing this script's parent
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BEETLE_DATA="$(cd "$SCRIPT_DIR/.." && pwd)"
 PROJECT_ROOT="${PROJECT_ROOT:-$(cd "$BEETLE_DATA/.." && pwd)}"
@@ -31,42 +43,47 @@ NUM_WORKERS="${NUM_WORKERS:-24}"
 
 cd "$BEETLE_DATA"
 
-# Activate virtual environment if it exists
+# Activate virtual environment if present
 if [ -f "venvs/demo/bin/activate" ]; then
     source venvs/demo/bin/activate
 fi
 
-# Verify Python is available
 if ! command -v python &> /dev/null; then
-    echo "ERROR: 'python' not found in PATH. Activate a virtual environment first."
+    echo "ERROR: 'python' not found. Activate a virtual environment first."
     exit 1
 fi
 
-# Verify critical dependencies before starting long-running jobs
 python -c "
 import datasets, pyarrow, transformers, tokenizers
 print(f'  datasets={datasets.__version__}  pyarrow={pyarrow.__version__}  transformers={transformers.__version__}')
-" || { echo "ERROR: Missing Python dependencies. Run: pip install -r requirements.txt"; exit 1; }
+" || { echo "ERROR: Missing dependencies. Run: pip install -r requirements.txt"; exit 1; }
 
 echo "============================================================"
-echo "Beetle-Data Pipeline: Storage-Optimized"
-echo "  Beetle-Data:  $BEETLE_DATA"
-echo "  Project root: $PROJECT_ROOT"
-echo "  Output dir:   $OUTPUT_DIR"
-echo "  Workers:      $NUM_WORKERS"
-echo "  Peak disk:    ~270 GB (with upload+cleanup)"
+echo "Beetle-Data Pipeline: STEP 1 — Static Pipeline (Stages 1+2+3)"
+echo "  Output dir:     $OUTPUT_DIR"
+echo "  Workers:        $NUM_WORKERS"
+echo "  Stream target:  28B clean tokens per language side"
+echo "  Train target:   24B tokens per bilingual pair (12B L1 + 12B EN)"
+echo "  Peak disk:      ~320 GB (with HF upload + cleanup)"
 echo "============================================================"
+echo ""
+echo "Note: Stage 1 (benchmark index) is skipped if already built."
+echo "      Delete $OUTPUT_DIR/benchmark_13gram.pkl to force rebuild."
+echo ""
 
-# Pass all arguments through to the Python orchestrator
+# Pass all arguments through to the Python orchestrator.
+# --skip-disk-check suppresses the pre-flight disk check (adjust via
+# max_local_disk_gb in PipelineConfig if you need a tighter guard).
 python -m pipeline.run_pipeline \
     --project-root "$PROJECT_ROOT" \
     --output-dir "$OUTPUT_DIR" \
     --hf-user "$HF_USER" \
     --num-workers "$NUM_WORKERS" \
+    --skip-disk-check \
     "$@"
 
 echo ""
 echo "============================================================"
-echo "Pipeline complete."
-echo "  Datasets uploaded to: https://huggingface.co/$HF_USER"
+echo "STEP 1 complete."
+echo "  Pretokenized datasets: https://huggingface.co/$HF_USER"
 echo "============================================================"

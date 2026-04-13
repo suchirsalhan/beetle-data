@@ -18,6 +18,37 @@ from typing import Dict, List, Optional
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# USER-CONFIGURABLE
+# Modify these constants to adapt the pipeline to your setup.
+# All other code reads from these — no other files need changing.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Token streaming budget per language (both L1 and English sides).
+# The decontamination stage (Stage 2) streams until it accumulates this many
+# clean tokens per language. The pretokenization stage (Stage 3) then writes
+# at most TARGET_TOKENS_PER_LANG tokens per bilingual pair (12B L1 + 12B EN).
+STREAM_TOKENS_PER_LANG: int = 28_000_000_000   # Clean tokens to collect in Parquet shards
+TARGET_TOKENS_PER_LANG: int = 24_000_000_000   # Clean tokens used for training (split L1 + EN)
+
+# Word-to-token conversion ratio used as a streaming proxy.
+# The pipeline counts whitespace words (fast) rather than running a BPE tokenizer
+# on every document. TOKENS_TO_WORDS_RATIO converts the token budget to words.
+# Average across languages: ~1.3 BPE tokens per word. CJK scripts (zh, ja) are
+# higher (~2-3x) but FineWeb-2 documents are long enough that word counts are
+# still a reliable proxy for stopping the stream.
+TOKENS_TO_WORDS_RATIO: float = 1.3
+
+# Training data sources. Change these to use a different HuggingFace dataset.
+# Requirements:
+#   TRAINING_DATASET_L1  — must accept a 'name' argument (subset per language)
+#   TRAINING_DATASET_EN  — loaded with split="train", no 'name' argument
+#   TRAINING_TEXT_FIELD  — the field in each row that holds the document text
+TRAINING_DATASET_L1: str = "HuggingFaceFW/fineweb-2"    # Non-English FineWeb source
+TRAINING_DATASET_EN: str = "HuggingFaceFW/fineweb-edu"  # English FineWeb-Edu source
+TRAINING_TEXT_FIELD: str  = "text"                       # Document text field name
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # BeetleStream v2: Stream Mode
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -143,6 +174,10 @@ def tokenizer_repo(lang: str, hf_user: str = "Beetle-Data") -> str:
 
 FINEWEB_EDU = "HuggingFaceFW/fineweb-edu"
 FINEWEB_2   = "HuggingFaceFW/fineweb-2"
+
+# Derived word-count target for streaming (used by decontaminate_stream.py).
+# Do not modify directly — change STREAM_TOKENS_PER_LANG and TOKENS_TO_WORDS_RATIO above.
+_STREAM_WORDS_PER_LANG: int = int(STREAM_TOKENS_PER_LANG / TOKENS_TO_WORDS_RATIO)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -284,14 +319,17 @@ BENCHMARK_DEFS: List[BenchmarkDef] = [
         },
     ),
 
-    # --- MECO-L2 (reading time stimuli, local TSV) ---
+    # --- MECO-L2 (reading time stimuli, HuggingFace TSV) ---
+    # Dataset: https://huggingface.co/datasets/suchirsalhan/MECO
+    # TSV columns: itemid, wordnum, word, FullText, FullTextMarked
+    # FullText repeats per word position → deduplicated in _load_hf_tsv().
     BenchmarkDef(
         name="meco_l2",
-        hf_id="",
+        hf_id="suchirsalhan/MECO",
         text_columns=["FullText"],
         split="",
-        config_mode="local_tsv",
-        local_path="beetlelm-rts-private/stimuli/meco_l2_stims.tsv",
+        config_mode="hf_tsv",
+        local_path="meco_l2_stims.tsv",  # filename within the HF repo
     ),
 ]
 
@@ -327,9 +365,15 @@ class PipelineConfig:
     min_doc_chars: int = 200
     max_doc_chars: int = 100_000
 
-    # Token targets (per language, approximate via word count)
-    target_words_per_lang: int = 22_000_000_000   # ~28B tokens at ~1.3 BPE/word
-    word_overshoot_factor: float = 1.15            # 15% overshoot
+    # Token targets (per language).
+    # stream_words_per_lang: how many clean words to collect in Parquet shards.
+    #   Derived from STREAM_TOKENS_PER_LANG ÷ TOKENS_TO_WORDS_RATIO ≈ 21.5B words
+    #   (equivalent to ~28B BPE tokens per language side).
+    # target_tokens_per_lang: how many tokens are used for training per bilingual pair.
+    #   The pretokenizer stops writing Arrow chunks once this count is reached.
+    #   Split 50:50 → 12B L1 + 12B EN = 24B total.
+    stream_words_per_lang: int = _STREAM_WORDS_PER_LANG  # ≈ 21.5B words → 28B tokens
+    target_tokens_per_lang: int = TARGET_TOKENS_PER_LANG # 24B tokens used for training
 
     # Pretokenization (must match beetlelm)
     seq_len: int = 512
@@ -339,15 +383,23 @@ class PipelineConfig:
     l1_ratio: float = 1 / 2
     en_ratio: float = 1 / 2
 
+    # Training data sources (read from user-configurable constants above).
+    training_dataset_l1: str = TRAINING_DATASET_L1  # Non-English FineWeb source
+    training_dataset_en: str = TRAINING_DATASET_EN  # English FineWeb-Edu source
+    training_text_field: str = TRAINING_TEXT_FIELD  # Document text field name
+
     # HuggingFace
     hf_user: str = "Beetle-Data"
     hf_token: str = ""
 
     # Storage management — upload to HF and delete local files
     upload_to_hf: bool = True               # upload Arrow datasets to HF after building
+    upload_raw_parquet: bool = False         # also upload raw decontaminated Parquet to HF
+                                             # (required for modular curriculum D+3 runs)
     cleanup_after_upload: bool = True        # delete local Arrow after successful upload
     cleanup_stage2_after_pretok: bool = True # delete L1 Parquet after both sides pretokenized
-    hf_dataset_suffix: str = "24B"          # repo naming: Beetle-Data/{lang}-{suffix}
+    hf_dataset_suffix: str = "28B"          # repo naming: Beetle-Data/{lang}-{suffix}
+                                             # (28B = streamed token count per language)
     max_local_disk_gb: int = 1000           # pre-flight check: abort if less than this free
 
     # Parallelization
@@ -365,15 +417,26 @@ class PipelineConfig:
             self.hf_token = os.environ.get("HF_TOKEN", "")
 
     def hf_dataset_repo(self, lang: str, side: str) -> str:
-        """Return HuggingFace dataset repo ID for a pretokenized dataset.
+        """Return HuggingFace dataset repo ID for a pretokenized Arrow dataset.
 
         Examples:
-            hf_dataset_repo("pl", "l1") → "Beetle-Data/pl-24B"
-            hf_dataset_repo("pl", "en") → "Beetle-Data/en-for-pl-24B"
+            hf_dataset_repo("pl", "l1") → "Beetle-Data/pl-28B"
+            hf_dataset_repo("pl", "en") → "Beetle-Data/en-for-pl-28B"
         """
         if side == "l1":
             return f"{self.hf_user}/{lang}-{self.hf_dataset_suffix}"
         return f"{self.hf_user}/en-for-{lang}-{self.hf_dataset_suffix}"
+
+    def hf_raw_parquet_repo(self, lang: str) -> str:
+        """Return HuggingFace dataset repo ID for raw decontaminated Parquet shards.
+
+        Used when upload_raw_parquet=True so that curriculum Stage D nodes can
+        download raw shards without needing a shared filesystem.
+
+        Example:
+            hf_raw_parquet_repo("pl") → "Beetle-Data/pl-raw-28B"
+        """
+        return f"{self.hf_user}/{lang}-raw-{self.hf_dataset_suffix}"
 
 
 def check_disk_space(path: str, required_gb: int = 300) -> bool:

@@ -1,16 +1,21 @@
 """
 post_hoc.py — Post-hoc contamination analysis for Infinigram-style querying.
 
-Provides two modes:
+Provides three modes:
 1. Index check: Given an eval string, check if its 13-grams match any benchmark
    n-grams — i.e., whether it would have caused document removal during
    decontamination.
 2. Corpus scan: Given a query string and language, search the decontaminated
    Parquet shards for documents containing matching n-grams. Returns doc_ids,
    URLs, and surrounding text context.
+   Works against:
+     (a) Local Parquet shards (immediately after Stage 2), or
+     (b) HuggingFace-hosted datasets (after upload) via --hf-user.
+3. Batch analysis from a file (one text per line).
 
 This enables analysis of how model performance on MECO reading times and
-beetle-analyze benchmarks correlates with training data presence.
+beetle-analyze benchmarks correlates with training data presence — the
+Infinigram-style querying approach.
 
 Usage:
     # Check if a string would have been flagged as contaminated
@@ -18,10 +23,15 @@ Usage:
         --index benchmark_13gram.pkl \\
         --text "The cat sat on the mat and watched the birds fly over."
 
-    # Search the training corpus for n-gram matches
+    # Scan local corpus (after Stage 2, before HF upload)
     python -m pipeline.post_hoc scan \\
         --lang pl --text "example query" \\
         --output-dir pipeline_output
+
+    # Scan HuggingFace corpus (after upload, no local files needed)
+    python -m pipeline.post_hoc scan \\
+        --lang pl --text "example query" \\
+        --hf-user Beetle-Data --hf-suffix 28B
 
     # Batch analysis from a file (one text per line)
     python -m pipeline.post_hoc batch \\
@@ -170,6 +180,100 @@ def scan_corpus(
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# Mode 2b: HuggingFace Corpus Scan (Infinigram-style, works without local files)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def scan_corpus_hf(
+    query_text: str,
+    lang: str,
+    hf_user: str = "Beetle-Data",
+    hf_suffix: str = "28B",
+    ngram_size: int = 13,
+    max_results: int = 100,
+    context_chars: int = 200,
+) -> List[Dict[str, Any]]:
+    """Search HuggingFace-hosted raw Parquet shards for documents containing query n-grams.
+
+    Streams from the HuggingFace dataset {hf_user}/{lang}-raw-{hf_suffix} and
+    performs n-gram overlap detection — identical to scan_corpus() but reads from
+    HuggingFace instead of local Parquet shards. Use this after the raw Parquet
+    shards have been uploaded (via --upload-raw-parquet / --curriculum-prep).
+
+    Args:
+        query_text: The eval string to search for.
+        lang: Language code for the corpus to search (e.g. 'de').
+        hf_user: HuggingFace organization (default: Beetle-Data).
+        hf_suffix: Dataset repo suffix (default: 28B — the stream token count).
+        ngram_size: N-gram size (should match index, default 13).
+        max_results: Maximum number of matching documents to return.
+        context_chars: Characters of context around each match.
+
+    Returns:
+        List of dicts with: doc_id, url, matched_ngrams, num_matches, context.
+    """
+    from datasets import load_dataset
+
+    # Extract query n-grams
+    query_tokens = tokenize_for_ngrams(query_text)
+    query_ngrams = extract_ngrams(query_tokens, ngram_size)
+    if not query_ngrams:
+        log.warning("Query text too short for %d-gram extraction", ngram_size)
+        return []
+
+    hf_repo = f"{hf_user}/{lang}-raw-{hf_suffix}"
+    log.info("Scanning HF corpus %s for %d query n-grams ...", hf_repo, len(query_ngrams))
+
+    try:
+        ds = load_dataset(hf_repo, split="train", streaming=True)
+    except Exception as e:
+        log.error("Could not load HF dataset %s: %s", hf_repo, e)
+        return []
+
+    results = []
+    doc_id = 0
+
+    for entry in ds:
+        text = entry.get("text", "")
+        url = entry.get("url", "")
+
+        if not text:
+            doc_id += 1
+            continue
+
+        doc_tokens = tokenize_for_ngrams(text)
+        doc_ngrams = extract_ngrams(doc_tokens, ngram_size)
+        overlaps = query_ngrams & doc_ngrams
+
+        if overlaps:
+            first_match = " ".join(sorted(overlaps)[0])
+            lower_text = text.lower()
+            match_pos = lower_text.find(first_match.split()[0])
+            if match_pos >= 0:
+                start = max(0, match_pos - context_chars)
+                end = min(len(text), match_pos + context_chars)
+                context = text[start:end]
+            else:
+                context = text[:context_chars * 2]
+
+            results.append({
+                "doc_id": entry.get("doc_id", doc_id),
+                "url": url,
+                "matched_ngrams": [" ".join(ng) for ng in sorted(overlaps)],
+                "num_matches": len(overlaps),
+                "context": context,
+            })
+
+            if len(results) >= max_results:
+                break
+
+        doc_id += 1
+
+    del ds
+    log.info("HF scan complete: %d matches found in %s", len(results), hf_repo)
+    return results
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Mode 3: Batch Analysis
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -217,11 +321,20 @@ def main():
     check_p.add_argument("--text", required=True, help="Text to check")
 
     # --- scan ---
-    scan_p = subparsers.add_parser("scan", help="Search corpus for n-gram matches")
+    scan_p = subparsers.add_parser(
+        "scan",
+        help="Search corpus for n-gram matches (local or HuggingFace)"
+    )
     scan_p.add_argument("--lang", required=True, help="Language to search")
     scan_p.add_argument("--text", required=True, help="Query text")
-    scan_p.add_argument("--output-dir", default="pipeline_output")
+    scan_p.add_argument("--output-dir", default="pipeline_output",
+                        help="Local pipeline output directory (for local scan)")
     scan_p.add_argument("--max-results", type=int, default=100)
+    scan_p.add_argument("--hf-user", type=str, default=None,
+                        help="HuggingFace org to scan (e.g. Beetle-Data). "
+                             "If set, scans HF dataset instead of local shards.")
+    scan_p.add_argument("--hf-suffix", type=str, default="28B",
+                        help="HF dataset suffix (default: 28B)")
 
     # --- batch ---
     batch_p = subparsers.add_parser("batch", help="Batch analysis from file")
@@ -242,8 +355,18 @@ def main():
         print(json.dumps(result, indent=2))
 
     elif args.mode == "scan":
-        results = scan_corpus(args.text, args.lang, args.output_dir,
-                              max_results=args.max_results)
+        if getattr(args, "hf_user", None):
+            # Infinigram-style scan against HuggingFace-hosted raw Parquet shards
+            results = scan_corpus_hf(
+                args.text, args.lang,
+                hf_user=args.hf_user,
+                hf_suffix=args.hf_suffix,
+                max_results=args.max_results,
+            )
+        else:
+            # Scan against local decontaminated Parquet shards
+            results = scan_corpus(args.text, args.lang, args.output_dir,
+                                  max_results=args.max_results)
         print(json.dumps(results, indent=2, default=str))
 
     elif args.mode == "batch":

@@ -242,8 +242,45 @@ def _load_hf_texts(bdef: BenchmarkDef) -> List[str]:
     return texts
 
 
+def _load_hf_tsv(bdef: BenchmarkDef) -> List[str]:
+    """Load text strings from a TSV file hosted on HuggingFace.
+
+    Downloads the TSV via huggingface_hub and reads the specified text columns.
+    Used for MECO-L2 (suchirsalhan/MECO, file: meco_l2_stims.tsv).
+
+    Columns in the MECO TSV: itemid, wordnum, word, FullText, FullTextMarked
+    FullText repeats for every word position in a passage → deduplicated.
+    """
+    from huggingface_hub import hf_hub_download
+
+    try:
+        tsv_path = hf_hub_download(
+            repo_id=bdef.hf_id,
+            filename=bdef.local_path,
+            repo_type="dataset",
+        )
+    except Exception as e:
+        log.warning("Could not download %s/%s from HuggingFace: %s",
+                    bdef.hf_id, bdef.local_path, e)
+        return []
+
+    df = pd.read_csv(tsv_path, sep="\t")
+    texts: List[str] = []
+    for col in bdef.text_columns:
+        if col in df.columns:
+            texts.extend(s for s in df[col].dropna().astype(str) if s.strip())
+        else:
+            log.warning("  Column '%s' not found in %s (available: %s)",
+                        col, bdef.local_path, list(df.columns))
+    # Deduplicate: MECO repeats FullText once per word position in the passage
+    texts = list(set(texts))
+    log.info("  MECO HF TSV: %d unique passages loaded from %s/%s",
+             len(texts), bdef.hf_id, bdef.local_path)
+    return texts
+
+
 def _load_local_tsv(bdef: BenchmarkDef, project_root: str) -> List[str]:
-    """Load text strings from a local TSV file."""
+    """Load text strings from a local TSV file (backwards-compatibility fallback)."""
     tsv_path = Path(project_root) / bdef.local_path
     if not tsv_path.exists():
         log.warning("Local file not found: %s", tsv_path)
@@ -330,7 +367,11 @@ def build_benchmark_index(
     for bdef in tqdm(BENCHMARK_DEFS, desc="Loading benchmarks"):
         log.info("Loading benchmark: %s (%s)", bdef.name, bdef.hf_id or bdef.local_path)
 
-        if bdef.config_mode == "local_tsv":
+        if bdef.config_mode == "hf_tsv":
+            # TSV hosted on HuggingFace (e.g., suchirsalhan/MECO)
+            texts = _load_hf_tsv(bdef)
+        elif bdef.config_mode == "local_tsv":
+            # Legacy: local TSV file (requires --project-root)
             texts = _load_local_tsv(bdef, cfg.project_root)
         else:
             texts = _load_hf_texts(bdef)

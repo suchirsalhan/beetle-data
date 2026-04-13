@@ -42,6 +42,8 @@ from .config import (
     LANG_REGISTRY,
     PipelineConfig,
     langs_for_node,
+    STREAM_TOKENS_PER_LANG,
+    TARGET_TOKENS_PER_LANG,
 )
 from .utils import normalize_text, passes_length_filter, word_count
 
@@ -65,9 +67,11 @@ class DecontaminationStats:
     docs_too_long: int = 0
     docs_contaminated: int = 0
     docs_clean: int = 0
-    words_accumulated: int = 0
+    words_accumulated: int = 0   # clean words written to Parquet
     shards_written: int = 0
     wall_time_sec: float = 0.0
+    stream_token_target: int = STREAM_TOKENS_PER_LANG
+    train_token_target: int = TARGET_TOKENS_PER_LANG
 
     def to_dict(self) -> dict:
         return {
@@ -83,6 +87,8 @@ class DecontaminationStats:
             "words_accumulated": self.words_accumulated,
             "shards_written": self.shards_written,
             "wall_time_sec": round(self.wall_time_sec, 1),
+            "stream_token_target": self.stream_token_target,
+            "train_token_target": self.train_token_target,
         }
 
 
@@ -94,14 +100,17 @@ class DecontaminationStats:
 _worker_index: Optional[BenchmarkIndex] = None
 _worker_min_chars: int = 200
 _worker_max_chars: int = 100_000
+_worker_text_field: str = "text"
 
 
-def _init_worker(index: BenchmarkIndex, min_chars: int, max_chars: int):
+def _init_worker(index: BenchmarkIndex, min_chars: int, max_chars: int,
+                 text_field: str = "text"):
     """Initializer for worker processes — receives the shared index."""
-    global _worker_index, _worker_min_chars, _worker_max_chars
+    global _worker_index, _worker_min_chars, _worker_max_chars, _worker_text_field
     _worker_index = index
     _worker_min_chars = min_chars
     _worker_max_chars = max_chars
+    _worker_text_field = text_field
 
 
 def _process_doc(doc: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -112,8 +121,11 @@ def _process_doc(doc: Dict[str, Any]) -> Optional[Dict[str, Any]]:
       - 'clean': passed all checks
       - 'too_short' / 'too_long': length filter
       - 'contaminated': contains benchmark n-grams
+
+    Note: _worker_text_field controls which dict key holds the document text.
+    Set via _init_worker to support datasets that use fields other than "text".
     """
-    text = doc.get("text", "")
+    text = doc.get(_worker_text_field, "") or doc.get("text", "")
     url = doc.get("url", "")
 
     # Normalize
@@ -236,25 +248,35 @@ def decontaminate_language(
     from datasets import load_dataset
 
     lc = LANG_REGISTRY[lang]
-    stats = DecontaminationStats(lang=lang)
+    stats = DecontaminationStats(
+        lang=lang,
+        stream_token_target=cfg.stream_words_per_lang,  # store word count for reporting
+        train_token_target=getattr(cfg, "target_tokens_per_lang", TARGET_TOKENS_PER_LANG),
+    )
     t0 = time.time()
 
     # Output directory
     out_dir = Path(cfg.output_dir) / "decontaminated" / lang
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Word target (with overshoot)
-    target_words = int(cfg.target_words_per_lang * cfg.word_overshoot_factor)
+    # Word target: stream until this many CLEAN words are accumulated.
+    # Derived from STREAM_TOKENS_PER_LANG ÷ TOKENS_TO_WORDS_RATIO (≈ 21.5B words = 28B tokens).
+    target_words = cfg.stream_words_per_lang
 
     log.info("Starting decontamination for %s (%s)", lang, lc.name)
-    log.info("  Target: ~%d words (%.0f%% overshoot)",
-             target_words, (cfg.word_overshoot_factor - 1) * 100)
+    log.info("  Stream target: %d clean words (~%dB tokens)",
+             target_words, STREAM_TOKENS_PER_LANG // 1_000_000_000)
+    log.info("  Training target: %dB tokens (applied at pretokenization)",
+             getattr(cfg, "target_tokens_per_lang", TARGET_TOKENS_PER_LANG) // 1_000_000_000)
+    log.info("  Source dataset: %s",
+             cfg.training_dataset_en if lc.is_english else cfg.training_dataset_l1)
 
-    # Stream dataset
+    # Stream dataset (configurable source — change TRAINING_DATASET_* in config.py)
     if lc.is_english:
-        ds = load_dataset(FINEWEB_EDU, split="train", streaming=True)
+        ds = load_dataset(cfg.training_dataset_en, split="train", streaming=True)
     else:
-        ds = load_dataset(FINEWEB_2, name=lc.fw2_name, split="train", streaming=True)
+        ds = load_dataset(cfg.training_dataset_l1, name=lc.fw2_name,
+                          split="train", streaming=True)
 
     # Shard writer
     writer = ShardWriter(out_dir, lang, shard_size=cfg.shard_size)
@@ -272,14 +294,19 @@ def decontaminate_language(
     num_workers = min(cfg.num_workers, cpu_count())
     batch: List[Dict] = []
 
+    text_field = getattr(cfg, "training_text_field", "text")
+
     with Pool(
         processes=num_workers,
         initializer=_init_worker,
-        initargs=(index, cfg.min_doc_chars, cfg.max_doc_chars),
+        initargs=(index, cfg.min_doc_chars, cfg.max_doc_chars, text_field),
     ) as pool:
 
         for entry in ds:
-            batch.append({"text": entry.get("text", ""), "url": entry.get("url", "")})
+            batch.append({
+                text_field: entry.get(text_field, "") or entry.get("text", ""),
+                "url": entry.get("url", ""),
+            })
 
             if len(batch) >= cfg.batch_size * num_workers:
                 # Split into sub-batches and distribute
@@ -361,7 +388,54 @@ def decontaminate_language(
              stats.to_dict()["contamination_rate"] * 100,
              stats.shards_written, stats.wall_time_sec / 60)
 
+    # Optional: upload raw decontaminated Parquet to HuggingFace.
+    # Required for curriculum mode Stages D+3 when running on separate nodes without
+    # a shared filesystem. Enable via cfg.upload_raw_parquet = True (or
+    # --curriculum-prep flag in launch_full_pipeline.sh).
+    if getattr(cfg, "upload_raw_parquet", False) and cfg.upload_to_hf:
+        _upload_raw_parquet(out_dir, lang, cfg)
+
     return stats
+
+
+def _upload_raw_parquet(out_dir: "Path", lang: str, cfg: "PipelineConfig") -> None:
+    """Upload raw decontaminated Parquet shards to HuggingFace.
+
+    Uploads to: {hf_user}/{lang}-raw-{hf_dataset_suffix}
+    This allows curriculum Stage D nodes to download raw shards without
+    needing a shared filesystem with the decontamination nodes.
+    """
+    from huggingface_hub import HfApi
+    import glob as _glob
+
+    raw_repo = cfg.hf_raw_parquet_repo(lang)
+    api = HfApi(token=cfg.hf_token or None)
+
+    # Ensure the repo exists
+    try:
+        api.create_repo(raw_repo, repo_type="dataset", exist_ok=True)
+    except Exception as e:
+        log.warning("Could not create repo %s: %s", raw_repo, e)
+        return
+
+    parquet_files = sorted(out_dir.glob("*.parquet"))
+    manifest_file = out_dir / f"{lang}_manifest.json"
+    stats_file = out_dir / f"{lang}_stats.json"
+
+    log.info("Uploading %d raw Parquet shards to %s ...", len(parquet_files), raw_repo)
+    for fpath in [*parquet_files, manifest_file, stats_file]:
+        if fpath.exists():
+            try:
+                api.upload_file(
+                    path_or_fileobj=str(fpath),
+                    path_in_repo=fpath.name,
+                    repo_id=raw_repo,
+                    repo_type="dataset",
+                )
+            except Exception as e:
+                log.warning("  Upload failed for %s: %s", fpath.name, e)
+
+    log.info("Raw Parquet upload complete → %s", raw_repo)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -386,6 +460,9 @@ def main():
                         help="Number of multiprocessing workers")
     parser.add_argument("--shard-size", type=int, default=50_000,
                         help="Documents per Parquet shard")
+    parser.add_argument("--upload-raw-parquet", action="store_true",
+                        help="Upload raw decontaminated Parquet to HF after writing "
+                             "(required for modular curriculum D+3 runs)")
     args = parser.parse_args()
 
     # Determine languages to process
@@ -406,9 +483,10 @@ def main():
         output_dir=args.output_dir,
         num_workers=args.num_workers,
         shard_size=args.shard_size,
+        upload_raw_parquet=args.upload_raw_parquet,
     )
     if args.target_words:
-        cfg.target_words_per_lang = args.target_words
+        cfg.stream_words_per_lang = args.target_words
 
     # Process each language sequentially
     all_stats = {}
