@@ -46,5 +46,11 @@ psutil>=5.9.0
 # deepspeed>=0.14.0      # large-scale training
 # wandb>=0.16.0          # experiment tracking
 
-# Deep learning (optional — for LLM annotation)
-# torch>=2.0
+# =====================================================
+# BeetleStream v2 (curriculum mode, Stages A-D)
+# =====================================================
+torch>=2.0                      # required for vLLM + embeddings
+vllm>=0.4.0                     # LLM serving for teacher annotation (Stage A)
+faiss-gpu>=1.7.4                # GPU-accelerated k-means clustering (Stage D)
+textstat>=0.7.3                 # Flesch-Kincaid readability (heuristic filter)
+pyyaml>=6.0                     # YAML config parsing

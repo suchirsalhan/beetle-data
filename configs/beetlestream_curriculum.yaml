@@ -1,0 +1,53 @@
+# BeetleStream v2: Pedagogical Multilingual Curriculum Engine
+#
+# Configuration for Stages A-D of the curriculum pipeline.
+# Used with: python -m pipeline.run_pipeline --stage A B C D \
+#            --beetlestream-config configs/beetlestream_curriculum.yaml
+
+beetlestream:
+  stream_mode: "curriculum"
+
+  # ─────────────────────────────────────────────────────────────────
+  # Stage A: Teacher Annotation
+  # ─────────────────────────────────────────────────────────────────
+  teacher:
+    backend: "vllm"
+    # Default: highest quality annotations
+    model: "meta-llama/Meta-Llama-3-70B-Instruct"
+    # Alternative: faster, lighter, lower quality
+    model_alternatives:
+      - "meta-llama/Meta-Llama-3-8B-Instruct"
+    sample_size: 500000       # total docs across all languages
+    batch_size: 16            # docs per LLM batch
+    max_concurrent: 32        # async semaphore for vLLM
+
+    calibration:
+      kidlm_repo: "tafseer-nayeem/KidLM-corpus"
+      clc_repo: "ADALM/CLC-L1-CEFR"
+      samples_per_cefr_level: 3   # 3 texts per CEFR level (a1-c2)
+      kidlm_samples: 20           # 20 passages from KidLM
+
+  # ─────────────────────────────────────────────────────────────────
+  # Stage C: Student Model
+  # ─────────────────────────────────────────────────────────────────
+  student:
+    embedding_model: "intfloat/multilingual-e5-base"
+    embedding_dim: 768
+    batch_size: 256           # docs per embedding batch
+
+  # ─────────────────────────────────────────────────────────────────
+  # Stage D: Heuristic Filters
+  # ─────────────────────────────────────────────────────────────────
+  heuristics:
+    stopword_density_range: [0.03, 0.60]
+    max_fk_grade: 18          # English only (Flesch-Kincaid)
+    min_script_consistency: 0.60
+    min_unique_5gram_ratio: 0.30
+
+  # ─────────────────────────────────────────────────────────────────
+  # Stage D: Indexing
+  # ─────────────────────────────────────────────────────────────────
+  indexing:
+    n_clusters: 200           # topic clusters per language (k-means)
+    shard_size: 10000         # docs per indexed Parquet shard
+    upload_to_hf: true        # push Beetle-Data/{lang}-indexed-24B

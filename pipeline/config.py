@@ -12,8 +12,54 @@ Central source-of-truth for:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 from typing import Dict, List, Optional
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# BeetleStream v2: Stream Mode
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class StreamMode(str, Enum):
+    """Data streaming mode for the pipeline."""
+    STATIC = "static"           # Original: decontaminate → pretokenize → Arrow
+    RANDOM = "random_stream"    # Naive streaming baseline (no curriculum)
+    CURRICULUM = "curriculum"    # Full BeetleStream v2 with quality/topic indexing
+
+
+@dataclass(frozen=True)
+class BeetleStreamConfig:
+    """Configuration for BeetleStream v2 pedagogical pipeline (Stages A-D)."""
+
+    # Teacher annotation (Stage A)
+    teacher_model: str = "meta-llama/Meta-Llama-3-70B-Instruct"
+    teacher_backend: str = "vllm"
+    teacher_base_url: str = "http://localhost:8000/v1"
+    teacher_sample_size: int = 500_000
+    teacher_batch_size: int = 16
+    teacher_max_concurrent: int = 32
+    kidlm_repo: str = "tafseer-nayeem/KidLM-corpus"
+    clc_repo: str = "ADALM/CLC-L1-CEFR"
+    kidlm_samples: int = 20
+    samples_per_cefr_level: int = 3
+
+    # Student model (Stage C)
+    embedding_model: str = "intfloat/multilingual-e5-base"
+    embedding_dim: int = 768
+    student_batch_size: int = 256
+
+    # Heuristic filters
+    stopword_density_min: float = 0.03
+    stopword_density_max: float = 0.60
+    max_fk_grade: float = 18.0
+    min_script_consistency: float = 0.60
+    min_unique_5gram_ratio: float = 0.30
+
+    # Indexing (Stage D)
+    n_clusters: int = 200
+    index_shard_size: int = 10_000
+    upload_indexed_to_hf: bool = True
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -308,6 +354,10 @@ class PipelineConfig:
     num_workers: int = 24
     shard_size: int = 50_000    # docs per Parquet shard
     batch_size: int = 1_000     # docs per worker batch
+
+    # BeetleStream v2 (curriculum mode)
+    stream_mode: str = "static"                           # "static" | "curriculum"
+    beetlestream: Optional[BeetleStreamConfig] = None     # None → static mode
 
     def __post_init__(self):
         if not self.hf_token:

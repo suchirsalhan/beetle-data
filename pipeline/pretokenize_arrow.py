@@ -497,6 +497,190 @@ def pretokenize_pair(
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# Curriculum-Mode Pretokenization (BeetleStream v2)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _iter_indexed_shards(indexed_dir: Path, lang: str):
+    """Yield (text, quality, difficulty, topic_id) from indexed Parquet shards.
+
+    Reads from Hive-partitioned structure:
+      indexed/lang={lang}/topic={id}/shard_*.parquet
+    """
+    lang_dir = indexed_dir / f"lang={lang}"
+    if not lang_dir.exists():
+        raise FileNotFoundError(f"No indexed data for lang={lang} at {lang_dir}")
+
+    for topic_dir in sorted(lang_dir.iterdir()):
+        if not topic_dir.is_dir() or not topic_dir.name.startswith("topic="):
+            continue
+        for shard_path in sorted(topic_dir.glob("*.parquet")):
+            table = pq.read_table(str(shard_path))
+            for i in range(table.num_rows):
+                yield {
+                    "text": table.column("text")[i].as_py(),
+                    "quality": float(table.column("quality")[i].as_py()),
+                    "difficulty": int(table.column("difficulty")[i].as_py()),
+                    "topic_id": int(table.column("topic_id")[i].as_py()),
+                }
+            del table
+
+
+def pretokenize_curriculum(
+    lang: str,
+    side: str,
+    cfg: "PipelineConfig",
+    target_tokens: Optional[int] = None,
+) -> PretokenizationStats:
+    """Pretokenize indexed shards for curriculum mode.
+
+    Like pretokenize_language() but reads from indexed shards and produces
+    Arrow datasets with extra columns: quality, difficulty, topic_id.
+
+    Each 513-token chunk inherits quality/difficulty/topic_id from its
+    source document.
+
+    Args:
+        lang: 2-letter language code.
+        side: 'l1' or 'en'.
+        cfg: Pipeline configuration.
+        target_tokens: Max tokens to produce.
+    """
+    stats = PretokenizationStats(lang=lang, side=side)
+    t0 = time.time()
+
+    if side == "l1":
+        source_lang = lang
+        output_name = f"{lang}-curriculum"
+    else:
+        source_lang = "en"
+        output_name = f"en-for-{lang}-curriculum"
+
+    indexed_dir = Path(cfg.output_dir) / "indexed"
+    arrow_dir = Path(cfg.output_dir) / "pretokenized" / output_name
+    tok_repo = tokenizer_repo(lang, cfg.hf_user)
+
+    log.info("Pretokenizing (curriculum) %s (side=%s)", lang, side)
+    log.info("  Source: %s/lang=%s", indexed_dir, source_lang)
+    log.info("  Output: %s", arrow_dir)
+
+    if target_tokens is None:
+        total_pair_tokens = 24_000_000_000
+        if side == "l1":
+            target_tokens = int(total_pair_tokens * cfg.l1_ratio)
+        else:
+            target_tokens = int(total_pair_tokens * cfg.en_ratio)
+
+    target_chunks = target_tokens // cfg.chunk_len
+    log.info("  Target: %d tokens (%d chunks)", target_tokens, target_chunks)
+
+    # Load tokenizer
+    from transformers import AutoTokenizer
+    tokenizer = AutoTokenizer.from_pretrained(tok_repo)
+    log.info("  Tokenizer loaded: %s (vocab=%d)", tok_repo, len(tokenizer))
+
+    # Accumulate chunks with metadata
+    all_input_ids = []
+    all_quality = []
+    all_difficulty = []
+    all_topic_id = []
+
+    buf = []  # token buffer for current document
+    current_meta = {"quality": 0.0, "difficulty": 2, "topic_id": 0}
+
+    for doc in _iter_indexed_shards(indexed_dir, source_lang):
+        text = doc["text"]
+        if not text:
+            continue
+
+        tokens = tokenizer.encode(text, add_special_tokens=False)
+        if not tokens:
+            continue
+
+        current_meta = {
+            "quality": doc["quality"],
+            "difficulty": doc["difficulty"],
+            "topic_id": doc["topic_id"],
+        }
+
+        # Pack into chunks (no cross-document bleeding)
+        for tok in tokens:
+            buf.append(tok)
+            if len(buf) == cfg.chunk_len:
+                all_input_ids.append(buf)
+                all_quality.append(current_meta["quality"])
+                all_difficulty.append(current_meta["difficulty"])
+                all_topic_id.append(current_meta["topic_id"])
+                buf = []
+
+                stats.tokens_total += cfg.chunk_len
+                if len(all_input_ids) >= target_chunks:
+                    break
+
+        # Discard remainder at document boundary (no cross-doc bleeding)
+        if buf:
+            stats.tokens_discarded += len(buf)
+        buf = []
+        stats.docs_processed += 1
+
+        if len(all_input_ids) >= target_chunks:
+            break
+
+    # Truncate to target
+    if len(all_input_ids) > target_chunks:
+        all_input_ids = all_input_ids[:target_chunks]
+        all_quality = all_quality[:target_chunks]
+        all_difficulty = all_difficulty[:target_chunks]
+        all_topic_id = all_topic_id[:target_chunks]
+
+    stats.chunks_created = len(all_input_ids)
+
+    # Write Arrow dataset with curriculum metadata columns
+    from datasets import Dataset as HFDataset
+
+    arrow_dir.mkdir(parents=True, exist_ok=True)
+
+    ds = HFDataset.from_dict({
+        "input_ids": all_input_ids,
+        "quality": all_quality,
+        "difficulty": all_difficulty,
+        "topic_id": all_topic_id,
+    })
+    ds.save_to_disk(str(arrow_dir))
+
+    stats.wall_time_sec = time.time() - t0
+    stats_path = arrow_dir / "pretok_stats.json"
+    with open(stats_path, "w") as f:
+        json.dump(stats.to_dict(), f, indent=2)
+
+    log.info("Done %s/%s (curriculum): %d chunks (%d tokens), %d docs, %.1f min",
+             lang, side, stats.chunks_created,
+             stats.chunks_created * cfg.chunk_len,
+             stats.docs_processed, stats.wall_time_sec / 60)
+
+    return stats
+
+
+def pretokenize_pair_curriculum(
+    lang: str,
+    cfg: "PipelineConfig",
+) -> Tuple[PretokenizationStats, PretokenizationStats]:
+    """Pretokenize both L1 and EN from indexed shards for curriculum mode."""
+    l1_stats = pretokenize_curriculum(lang, "l1", cfg)
+    en_stats = pretokenize_curriculum(lang, "en", cfg)
+
+    # Upload curriculum datasets to HF
+    l1_arrow_dir = Path(cfg.output_dir) / "pretokenized" / f"{lang}-curriculum"
+    en_arrow_dir = Path(cfg.output_dir) / "pretokenized" / f"en-for-{lang}-curriculum"
+    l1_repo = f"{cfg.hf_user}/{lang}-curriculum-{cfg.hf_dataset_suffix}"
+    en_repo = f"{cfg.hf_user}/en-for-{lang}-curriculum-{cfg.hf_dataset_suffix}"
+
+    upload_to_hf_and_cleanup(l1_arrow_dir, l1_repo, cfg)
+    upload_to_hf_and_cleanup(en_arrow_dir, en_repo, cfg)
+
+    return l1_stats, en_stats
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # CLI
 # ═══════════════════════════════════════════════════════════════════════════════
 
