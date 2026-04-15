@@ -131,6 +131,66 @@ export HF_TOKEN=<your-token>
 
 ---
 
+## Step 0: Train Tokenizers
+
+Bilingual tokenizers must be trained and published to HuggingFace **before** running the pipeline (Stage 3 loads them for pretokenization). Each tokenizer is trained on 2M sentences streamed from the same FineWeb sources used by the pipeline: `HuggingFaceFW/fineweb-2` (L1) and `HuggingFaceFW/fineweb-edu` (English).
+
+**Train all 20 languages** (sequential, ~30 min per language):
+
+```bash
+bash tok/run.sh
+```
+
+**Train a single language** (e.g., Arabic):
+
+```bash
+python tok/multi-train-tok.py --lang ar --hf-user Beetle-Data --vocab-size 50000 --sentences 2000000
+```
+
+**Train a subset** (e.g., batch 4 languages):
+
+```bash
+for lang in sv el ca fa id; do
+  python tok/multi-train-tok.py --lang "$lang" --hf-user Beetle-Data --vocab-size 50000 --sentences 2000000
+done
+```
+
+Output: `Beetle-Data/tokenizer-{lang}-en` on HuggingFace Hub (e.g., `Beetle-Data/tokenizer-ar-en`).
+
+Japanese and Chinese have dedicated scripts (`tok/ja-en-tok.py`, `tok/zh-en-tok.py`) that are called automatically by `tok/run.sh`.
+
+| Language Group | Tokenizer Model | Normalization | Notes |
+|----------------|-----------------|---------------|-------|
+| Most Latin-script, Greek, Russian | BPE | NFKC | Standard ByteLevel pre-tokenization |
+| Arabic | Unigram | NFKC + tatweel removal | UnicodeScripts + Metaspace pre-tokenization |
+| Persian | BPE | NFKC + tatweel removal | ByteLevel pre-tokenization |
+| Chinese | BPE | NFC | Prefix space, trim offsets |
+| Japanese | BPE | NFC | mecab-based pre-tokenization (separate script) |
+
+---
+
+## Step 0: Train Tokenizers
+
+Bilingual tokenizers must be trained and published to HuggingFace **before** running the pipeline (Stage 3 loads tokenizers from HF). Each tokenizer is trained on 2M sentences streamed from the same FineWeb sources used by the pipeline (`HuggingFaceFW/fineweb-2` for L1, `HuggingFaceFW/fineweb-edu` for English).
+
+**Train all 20 languages** (sequential, ~30 min per language):
+```bash
+bash tok/run.sh
+```
+
+**Train a single language** (e.g., Arabic):
+```bash
+python tok/multi-train-tok.py --lang ar --hf-user Beetle-Data --vocab-size 50000 --sentences 2000000
+```
+
+**Output**: `Beetle-Data/tokenizer-{lang}-en` on HuggingFace Hub (e.g., `Beetle-Data/tokenizer-ar-en`).
+
+The pipeline's pretokenization stage (`pipeline/pretokenize_arrow.py`) loads the tokenizer via `config.tokenizer_repo(lang)` which resolves to these HF repos. If a tokenizer is missing, Stage 3 will fail with a download error.
+
+Supported languages and tokenizer types are defined in `tok/multi-train-tok.py:LANG_CONFIGS`. Japanese and Chinese use separate training scripts (`tok/ja-en-tok.py`, `tok/zh-en-tok.py`) but are included in the batch `run.sh`.
+
+---
+
 ## Execution: 4-Node Cluster
 
 All four steps below are designed for 4 nodes of 8 × A100-80GB GPUs each with a shared filesystem (e.g., `/mnt/ssd-3`).
@@ -632,6 +692,6 @@ beetle-data/
     launch_extensions.sh          # Extension language pipeline
     launch_low_resource.sh        # Low-resource language pipeline
     verify_output.py              # End-to-end validation
-  tok/                         # Tokenizer training scripts (already complete)
+  tok/                         # Tokenizer training scripts (Step 0 — run before Stage 3)
   data/                        # Legacy decontamination scripts
 ```
