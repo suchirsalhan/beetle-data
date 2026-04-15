@@ -49,6 +49,8 @@ from tqdm import tqdm
 from .config import (
     LANG_REGISTRY,
     PipelineConfig,
+    TOKENIZER_VOCAB_SIZE,
+    TOKENIZER_TRAINING_SENTENCES,
     langs_for_node,
     tokenizer_repo,
 )
@@ -63,6 +65,36 @@ log = logging.getLogger("Pretokenize")
 # Maximum chunks to hold in memory before flushing to a temporary Arrow file.
 # 500K chunks * 513 ints * 8 bytes (Python int) ≈ 2 GB peak per flush.
 ARROW_FLUSH_CHUNKS = 500_000
+
+
+def ensure_tokenizer(tok_repo: str, lang: str, hf_user: str) -> None:
+    """Check if the tokenizer exists on HuggingFace; train and push if missing.
+
+    Must be called on the main process BEFORE spawning the multiprocessing Pool,
+    since worker processes cannot train tokenizers.
+    """
+    from transformers import PreTrainedTokenizerFast
+
+    try:
+        PreTrainedTokenizerFast.from_pretrained(tok_repo)
+        log.info("Tokenizer found: %s", tok_repo)
+    except OSError:
+        log.warning(
+            "Tokenizer %s not found on HuggingFace. Training automatically...",
+            tok_repo,
+        )
+        import importlib.util
+        tok_path = Path(__file__).resolve().parents[1] / "tok" / "multi-train-tok.py"
+        spec = importlib.util.spec_from_file_location("multi_train_tok", tok_path)
+        multi_train_tok = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(multi_train_tok)
+        multi_train_tok.train_and_push(
+            lang=lang,
+            hf_user=hf_user,
+            vocab_size=TOKENIZER_VOCAB_SIZE,
+            n_sentences=TOKENIZER_TRAINING_SENTENCES,
+        )
+        log.info("Tokenizer trained and pushed: %s", tok_repo)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -311,6 +343,9 @@ def pretokenize_language(
 
     # Use the bilingual tokenizer for this language pair
     tok_repo = tokenizer_repo(lang, cfg.hf_user)
+
+    # Auto-detect: train tokenizer if not found on HuggingFace
+    ensure_tokenizer(tok_repo, lang, cfg.hf_user)
 
     log.info("Pretokenizing %s (side=%s)", lang, side)
     log.info("  Source: %s", parquet_dir)
@@ -561,6 +596,9 @@ def pretokenize_curriculum(
     indexed_dir = Path(cfg.output_dir) / "indexed"
     arrow_dir = Path(cfg.output_dir) / "pretokenized" / output_name
     tok_repo = tokenizer_repo(lang, cfg.hf_user)
+
+    # Auto-detect: train tokenizer if not found on HuggingFace
+    ensure_tokenizer(tok_repo, lang, cfg.hf_user)
 
     log.info("Pretokenizing (curriculum) %s (side=%s)", lang, side)
     log.info("  Source: %s/lang=%s", indexed_dir, source_lang)

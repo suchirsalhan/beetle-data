@@ -137,63 +137,79 @@ def build_trainer(cfg, vocab_size):
 # =====================================================
 # 4. MAIN PIPELINE
 # =====================================================
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--lang", required=True, choices=sorted(LANG_CONFIGS))
-    parser.add_argument("--hf-user", default="RA-ALTA")
-    parser.add_argument("--vocab-size", type=int, default=50000)
-    parser.add_argument("--sentences", type=int, default=1000000)
-    args = parser.parse_args()
+def train_and_push(
+    lang: str,
+    hf_user: str = "Beetle-Data",
+    vocab_size: int = 50_000,
+    n_sentences: int = 2_000_000,
+) -> "PreTrainedTokenizerFast":
+    """Train a bilingual BPE/Unigram tokenizer and optionally push to HF Hub.
 
-    cfg = LANG_CONFIGS[args.lang]
-    out_dir = Path(f"tokenizer-{args.lang}-local")
+    Returns the trained PreTrainedTokenizerFast object.
+    """
+    if lang not in LANG_CONFIGS:
+        raise ValueError(f"Unknown language: {lang}. Available: {sorted(LANG_CONFIGS)}")
+
+    cfg = LANG_CONFIGS[lang]
+    out_dir = Path(f"tokenizer-{lang}-local")
     out_dir.mkdir(exist_ok=True)
 
-    print(f"\n--- 🛠️ Preparing {cfg['name']} ({args.lang}) Pipeline ---")
+    print(f"\n--- Preparing {cfg['name']} ({lang}) Pipeline ---")
     tokenizer = build_tokenizer(cfg)
-    trainer = build_trainer(cfg, args.vocab_size)
-    
-    # Progress Tracking
-    print(f"🚀 Training {cfg['model'].upper()} model...")
-    
-    # We wrap the generator in tqdm so train_from_iterator displays a progress bar
-    # 'total' is required for the percentage and ETA to work
-    progress_iterator = tqdm(
-        get_training_corpus(cfg, args.sentences), 
-        total=args.sentences, 
-        desc="Streaming & Training", 
-        unit=" sentences",
-        colour="cyan"
-    )
+    trainer = build_trainer(cfg, vocab_size)
 
+    print(f"Training {cfg['model'].upper()} model...")
+    progress_iterator = tqdm(
+        get_training_corpus(cfg, n_sentences),
+        total=n_sentences,
+        desc="Streaming & Training",
+        unit=" sentences",
+        colour="cyan",
+    )
     tokenizer.train_from_iterator(progress_iterator, trainer=trainer)
 
-    print(f"\n✅ Training finished. Saving files...")
-    
-    # Convert to Transformers Fast Tokenizer
+    print(f"\nTraining finished. Saving files...")
+
     hf_tokenizer = PreTrainedTokenizerFast(
         tokenizer_object=tokenizer,
         bos_token="<s>",
         eos_token="</s>",
         pad_token="<pad>",
         unk_token="<unk>",
-        clean_up_tokenization_spaces=cfg.get("clean_up_spaces", False)
+        clean_up_tokenization_spaces=cfg.get("clean_up_spaces", False),
     )
-    
-    hf_tokenizer.save_pretrained(out_dir)
-    print(f"📁 Local files saved to: {out_dir}")
 
-    # Hub Push
+    hf_tokenizer.save_pretrained(out_dir)
+    print(f"Local files saved to: {out_dir}")
+
     hf_token = os.environ.get("HF_TOKEN")
     if hf_token:
-        repo_id = f"{args.hf_user}/tokenizer-{args.lang}-en"
-        print(f"📤 Pushing to Hub: {repo_id}...")
+        repo_id = f"{hf_user}/tokenizer-{lang}-en"
+        print(f"Pushing to Hub: {repo_id}...")
         create_repo(repo_id, exist_ok=True, token=hf_token)
         hf_tokenizer.push_to_hub(repo_id, token=hf_token)
-        print(f"✨ Pushed successfully!")
+        print(f"Pushed successfully: {repo_id}")
     else:
-        print("⏭️ Skipping Hub push (HF_TOKEN not found in environment).")
+        print("Skipping Hub push (HF_TOKEN not found in environment).")
+
+    return hf_tokenizer
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--lang", required=True, choices=sorted(LANG_CONFIGS))
+    parser.add_argument("--hf-user", default="Beetle-Data")
+    parser.add_argument("--vocab-size", type=int, default=50000)
+    parser.add_argument("--sentences", type=int, default=2000000)
+    args = parser.parse_args()
+
+    train_and_push(
+        lang=args.lang,
+        hf_user=args.hf_user,
+        vocab_size=args.vocab_size,
+        n_sentences=args.sentences,
+    )
+
 
 if __name__ == "__main__":
-    # Force flushing of stdout for immediate terminal feedback
     main()

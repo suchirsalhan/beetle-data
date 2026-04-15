@@ -38,6 +38,10 @@ TARGET_TOKENS_PER_LANG: int = 24_000_000_000   # Clean tokens used for training 
 # still a reliable proxy for stopping the stream.
 TOKENS_TO_WORDS_RATIO: float = 1.3
 
+# ── Tokenizer training defaults (used by auto-detection in pretokenize_arrow) ─
+TOKENIZER_VOCAB_SIZE: int = 50_000
+TOKENIZER_TRAINING_SENTENCES: int = 2_000_000
+
 # Training data sources. Change these to use a different HuggingFace dataset.
 # Requirements:
 #   TRAINING_DATASET_L1  — must accept a 'name' argument (subset per language)
