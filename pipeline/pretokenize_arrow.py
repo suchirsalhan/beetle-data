@@ -455,23 +455,12 @@ def upload_to_hf_and_cleanup(
     if not cfg.upload_to_hf:
         return True
 
-    from huggingface_hub import HfApi, create_repo
+    from datasets import load_from_disk
 
     try:
-        api = HfApi(token=cfg.hf_token)
-
-        # Create repo if it doesn't exist
-        create_repo(repo_id, repo_type="dataset", exist_ok=True,
-                    token=cfg.hf_token, private=False)
-
-        # Upload entire Arrow directory
         log.info("Uploading %s to %s ...", arrow_dir, repo_id)
-        api.upload_folder(
-            folder_path=str(arrow_dir),
-            repo_id=repo_id,
-            repo_type="dataset",
-            commit_message=f"Pretokenized data ({arrow_dir.name})",
-        )
+        ds = load_from_disk(str(arrow_dir))
+        ds.push_to_hub(repo_id, token=cfg.hf_token, private=False)
         log.info("Upload complete: %s", repo_id)
 
         # Delete local copy to free disk

@@ -551,23 +551,20 @@ def pretokenize_all(
 # =============================================================================
 
 def _upload_to_hf(arrow_dir: Path, repo_id: str, cleanup: bool = False) -> bool:
-    """Upload Arrow dataset to HuggingFace Hub."""
-    from huggingface_hub import HfApi, create_repo
+    """Upload Arrow dataset to HuggingFace Hub as Parquet.
+
+    Uses push_to_hub (not upload_folder) so the dataset is properly
+    serialized as Parquet, avoiding the empty-struct _format_kwargs
+    error that Arrow-IPC metadata causes on the Hub viewer.
+    """
+    from datasets import load_from_disk
 
     try:
         token = os.environ.get("HF_TOKEN")
-        api = HfApi(token=token)
-
-        create_repo(repo_id, repo_type="dataset", exist_ok=True,
-                    token=token, private=False)
 
         log.info("  Uploading to %s ...", repo_id)
-        api.upload_folder(
-            folder_path=str(arrow_dir),
-            repo_id=repo_id,
-            repo_type="dataset",
-            commit_message=f"Pretokenized BabyBabel ({arrow_dir.name})",
-        )
+        ds = load_from_disk(str(arrow_dir))
+        ds.push_to_hub(repo_id, token=token, private=False)
         log.info("  Upload complete: %s", repo_id)
 
         if cleanup:
