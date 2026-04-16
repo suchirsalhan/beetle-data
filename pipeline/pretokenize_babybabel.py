@@ -380,7 +380,8 @@ def pretokenize_one(
         "tokens_discarded": total_discarded,
         "wall_time_sec": round(wall_time, 1),
     }
-    with open(arrow_dir / "pretok_stats.json", "w") as f:
+    stats_path = arrow_dir.parent / f"{arrow_dir.name}_pretok_stats.json"
+    with open(stats_path, "w") as f:
         json.dump(stats, f, indent=2)
 
     # Upload to HuggingFace
