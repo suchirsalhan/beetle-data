@@ -193,30 +193,88 @@ Supported languages and tokenizer types are defined in `tok/multi-train-tok.py:L
 
 ## Human-Scale BabyBabel Pretokenization
 
-Pretokenizes BabyBabel raw text for human-scale bilingual experiments in BeetleLM. Produces Arrow datasets compatible with `beetlelm`'s `PretokenizedMultilingualDataset` and pushes them to `Beetle-Data/` on HuggingFace Hub.
+Pretokenizes BabyBabel raw text for human-scale mono/bi/trilingual experiments in BeetleLM. Produces Arrow datasets compatible with `beetlelm`'s `PretokenizedMultilingualDataset` and pushes them to **`Beetle-HumanScale/`** on HuggingFace Hub.
+
+> **HF org change:** Human-scale data and tokenizers now live under [`Beetle-HumanScale`](https://huggingface.co/Beetle-HumanScale) (replacing `Beetle-Data` for BabyBabel). The `Beetle-Data` org continues to host the large-scale FineWeb pipeline outputs.
 
 ### Why pretokenize in beetle-data?
 
 Human-scale experiments (Experiment 1) run hundreds of sweep configs. Without pretokenization, each training run re-tokenizes the same BabyBabel text on-the-fly. Pretokenizing once in beetle-data and loading from HF (`pretokenized_source: "hf_arrow"`) eliminates this overhead across all runs.
+
+### Token Budgets
+
+| Mode | Per-language budget | Total tokens |
+|------|-------------------|--------------|
+| Monolingual | 100M | 100M |
+| Bilingual (balanced) | 50M x 2 | 100M |
+| Bilingual B4 Classroom | 80M L1 + 20M L2 | 100M |
+| Trilingual | 33M x 3 | ~100M |
+
+### Dataset Naming Conventions
+
+All datasets are pushed to the `Beetle-HumanScale` HF org. The naming scheme encodes the language, token budget, and tokenizer used:
+
+| Mode | L1 dataset name | L2 / other dataset names |
+|------|----------------|--------------------------|
+| **Monolingual** | `Beetle-HumanScale/{lang}-100M` | -- |
+| **Bilingual (balanced)** | `Beetle-HumanScale/{l1}-50M-{tok_pair}` | `Beetle-HumanScale/{l2}-for-{l1}-50M-{tok_pair}` |
+| **Bilingual B4 Classroom** | `Beetle-HumanScale/{l1}-80M-{tok_pair}` | `Beetle-HumanScale/{l2}-for-{l1}-20M-{tok_pair}` |
+| **Trilingual** | `Beetle-HumanScale/{lang}-33M-{tok_triple}` | (one dataset per language in the triple) |
+
+Examples:
+- Monolingual Dutch: `Beetle-HumanScale/nld-100M`
+- Bilingual Dutch L1: `Beetle-HumanScale/nld-50M-eng-nld`
+- Bilingual English L2 for Dutch: `Beetle-HumanScale/eng-for-nld-50M-eng-nld`
+- B4 Classroom Dutch L1: `Beetle-HumanScale/nld-80M-eng-nld`
+- B4 Classroom English L2 for Dutch: `Beetle-HumanScale/eng-for-nld-20M-eng-nld`
+- Trilingual Dutch: `Beetle-HumanScale/nld-33M-eng-nld-zho`
+
+### Tokenizer Naming Conventions
+
+Tokenizers are also hosted under `Beetle-HumanScale`. Naming follows the language combination in sorted order:
+
+| Mode | Tokenizer repo |
+|------|---------------|
+| Monolingual | `Beetle-HumanScale/bpe-humanscale-{lang}` |
+| Bilingual | `Beetle-HumanScale/bpe-humanscale-{sorted_pair}` |
+| Trilingual | `Beetle-HumanScale/bpe-humanscale-{sorted_triple}` |
+
+Examples:
+- Monolingual Dutch: `Beetle-HumanScale/bpe-humanscale-nld`
+- Bilingual eng+nld: `Beetle-HumanScale/bpe-humanscale-eng-nld`
+- Trilingual eng+nld+zho: `Beetle-HumanScale/bpe-humanscale-eng-nld-zho`
+
+### Automatic Tokenizer Training (`ensure_tokenizer()`)
+
+Tokenizers are auto-detected and auto-trained if missing on the HF Hub. When a pretokenization run begins, `ensure_tokenizer()` checks whether the required tokenizer repo exists on `Beetle-HumanScale`. If the tokenizer is not found, it is trained on the fly and pushed to the Hub before pretokenization proceeds. No manual tokenizer training step is needed for human-scale experiments.
 
 ### Input / Output
 
 | | Description |
 |---|---|
 | **Input** | Raw text from `BabyLM-community/babylm-{lang}` (9 languages: zho, fas, eng, nld, bul, fra, ind, deu, ukr) |
-| **Tokenizer** | `Beetle-HumanScale/bpe-humanscale-{l1}-{l2}` (36 bilingual pairs, trained by `beetlelm/script/run_tokenizers.sh`) |
-| **Output** | `Beetle-Data/BabyBabel-{lang}-{target}-{l1}-{l2}` Arrow datasets with `input_ids` column (chunk_len=513) |
+| **Tokenizer** | `Beetle-HumanScale/bpe-humanscale-{lang(s)}` (auto-trained if missing) |
+| **Output** | Arrow datasets on `Beetle-HumanScale/` with `input_ids` column (chunk_len=513) |
 | **Format** | Exactly matches `beetlelm/src/bilingual/data/pretokenize.py`: `encode(text, add_special_tokens=False)`, pack into 513-token chunks, no cross-document token bleeding |
 
-Since tokenizers are bilingual, the same raw text tokenized with different pair tokenizers produces different `input_ids`. Each output dataset encodes the tokenizer used in its name (e.g., `BabyBabel-nld-50M-eng-nld` = Dutch text tokenized with the eng-nld tokenizer).
+Since tokenizers encode the language combination, the same raw text tokenized with different tokenizers produces different `input_ids`. Each output dataset encodes the tokenizer used in its name (e.g., `nld-50M-eng-nld` = Dutch text tokenized with the eng-nld tokenizer).
 
 ### Usage
 
 ```bash
-# Single pair (produces 2 Arrow datasets: one per language)
+# Monolingual (100M tokens)
+python -m pipeline.pretokenize_babybabel --mono --lang nld --target 100M
+
+# Bilingual (50M per side)
 python -m pipeline.pretokenize_babybabel --pair eng nld
 
-# 3 pilot pairs: nld-eng, zho-eng, zho-nld (6 datasets)
+# B4 Classroom (80M L1 + 20M L2)
+python -m pipeline.pretokenize_babybabel --pair eng nld --l1-target 80M --l2-target 20M
+
+# Trilingual (33M per side)
+python -m pipeline.pretokenize_babybabel --triple eng nld zho --target 33M
+
+# Pilot (3 MECO pairs)
 python -m pipeline.pretokenize_babybabel --pilot
 
 # All 36 pairs (72 Arrow datasets)
@@ -224,14 +282,11 @@ python -m pipeline.pretokenize_babybabel --all
 
 # Skip HuggingFace upload (local Arrow only)
 python -m pipeline.pretokenize_babybabel --all --no-upload
-
-# Custom token target
-python -m pipeline.pretokenize_babybabel --pilot --target 100M
 ```
 
 ### SLURM Submission
 
-Human-scale data is small (~50M tokens/lang), so a single node suffices:
+Human-scale data is small (~100M tokens total), so a single node suffices:
 
 ```bash
 # All 36 pairs (under 1 hour)
@@ -251,8 +306,8 @@ BeetleLM training configs reference these datasets with `pretokenized_source: "h
 ```yaml
 # In a beetlelm training config:
 data:
-  lang_sources: ["Beetle-Data/BabyBabel-nld-50M-eng-nld"]
-  l2_streams: ["Beetle-Data/BabyBabel-eng-50M-eng-nld"]
+  lang_sources: ["Beetle-HumanScale/nld-50M-eng-nld"]
+  l2_streams: ["Beetle-HumanScale/eng-for-nld-50M-eng-nld"]
   pretokenized: true
   pretokenized_source: "hf_arrow"
 ```
@@ -412,7 +467,21 @@ Wall-clock is dominated by the sequential dependency of STEP 3 (curriculum A+B+C
 
 ## HuggingFace Datasets
 
-All outputs are uploaded to the `Beetle-Data` organization.
+Large-scale FineWeb outputs are uploaded to the `Beetle-Data` organization. Human-scale BabyBabel data and tokenizers are uploaded to `Beetle-HumanScale`.
+
+### Human-Scale (Beetle-HumanScale)
+
+```
+Beetle-HumanScale/{lang}-100M                         # Monolingual Arrow (100M tokens)
+Beetle-HumanScale/{l1}-50M-{tok_pair}                  # Bilingual L1 Arrow (50M tokens)
+Beetle-HumanScale/{l2}-for-{l1}-50M-{tok_pair}         # Bilingual L2 Arrow (50M tokens)
+Beetle-HumanScale/{l1}-80M-{tok_pair}                  # B4 Classroom L1 Arrow (80M tokens)
+Beetle-HumanScale/{l2}-for-{l1}-20M-{tok_pair}         # B4 Classroom L2 Arrow (20M tokens)
+Beetle-HumanScale/{lang}-33M-{tok_triple}              # Trilingual Arrow (33M tokens each)
+Beetle-HumanScale/bpe-humanscale-{lang}                # Monolingual tokenizer
+Beetle-HumanScale/bpe-humanscale-{sorted_pair}         # Bilingual tokenizer
+Beetle-HumanScale/bpe-humanscale-{sorted_triple}       # Trilingual tokenizer
+```
 
 ### Static Mode
 

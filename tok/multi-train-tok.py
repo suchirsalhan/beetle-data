@@ -195,20 +195,182 @@ def train_and_push(
     return hf_tokenizer
 
 
+# =====================================================
+# 5. BABYBABEL TOKENIZER TRAINING (human-scale)
+# =====================================================
+
+# BabyBabel language configs — 3-letter ISO 639-3 codes, BPE, NFKC normalization.
+# These map to BabyLM-community/babylm-{lang} datasets on HuggingFace.
+BABYBABEL_CONFIGS = {
+    "zho": {"name": "Chinese", "model": "bpe", "norm": "nfc",
+            "add_prefix_space": True, "trim_offsets": True, "clean_up_spaces": True, "min_freq": 2},
+    "fas": {"name": "Persian", "model": "bpe", "norm": "nfkc+tatweel", "min_freq": 2},
+    "eng": {"name": "English", "model": "bpe", "norm": "nfkc", "min_freq": 2},
+    "nld": {"name": "Dutch", "model": "bpe", "norm": "nfkc", "min_freq": 2},
+    "bul": {"name": "Bulgarian", "model": "bpe", "norm": "nfkc", "min_freq": 2},
+    "fra": {"name": "French", "model": "bpe", "norm": "nfkc", "min_freq": 2},
+    "ind": {"name": "Indonesian", "model": "bpe", "norm": "nfkc", "min_freq": 2},
+    "deu": {"name": "German", "model": "bpe", "norm": "nfkc", "min_freq": 2},
+    "ukr": {"name": "Ukrainian", "model": "bpe", "norm": "nfkc", "min_freq": 2},
+}
+
+
+def get_babybabel_corpus(langs, max_sentences_per_lang=None):
+    """Yield text from BabyLM-community datasets, interleaving languages equally."""
+    from datasets import load_dataset as ld
+
+    iters = {}
+    for lang in langs:
+        ds = ld(f"BabyLM-community/babylm-{lang}", split="train")
+        # Auto-detect text column
+        text_col = next((c for c in ds.column_names if ds.features[c].dtype == "string"), "text")
+        iters[lang] = iter(ds)
+        iters[f"{lang}_col"] = text_col
+
+    counts = {lang: 0 for lang in langs}
+    exhausted = set()
+
+    while len(exhausted) < len(langs):
+        for lang in langs:
+            if lang in exhausted:
+                continue
+            if max_sentences_per_lang and counts[lang] >= max_sentences_per_lang:
+                exhausted.add(lang)
+                continue
+            try:
+                entry = next(iters[lang])
+                text = entry.get(iters[f"{lang}_col"], "")
+                if isinstance(text, str) and text.strip():
+                    yield text.strip().replace("\n", " ")
+                    counts[lang] += 1
+            except StopIteration:
+                exhausted.add(lang)
+
+
+def train_babybabel_tokenizer(
+    langs: list,
+    hf_repo: str,
+    vocab_size: int = 50_000,
+    max_sentences_per_lang: int = 500_000,
+) -> "PreTrainedTokenizerFast":
+    """Train a BPE tokenizer on BabyBabel data and push to HF Hub.
+
+    Works for monolingual (1 lang), bilingual (2 langs), or trilingual (3 langs).
+    Data is interleaved equally from each language's BabyLM-community dataset.
+
+    Args:
+        langs: List of language codes (e.g., ["eng", "nld"] or ["eng"]).
+        hf_repo: Full HF repo ID (e.g., "Beetle-HumanScale/bpe-humanscale-eng-nld").
+        vocab_size: BPE vocabulary size.
+        max_sentences_per_lang: Max sentences per language for training.
+    """
+    # Use the config from the first language for tokenizer architecture
+    # (all BabyBabel langs use BPE with NFKC except Chinese/Persian)
+    primary_lang = langs[0]
+    if primary_lang not in BABYBABEL_CONFIGS:
+        raise ValueError(f"Unknown BabyBabel language: {primary_lang}. "
+                         f"Available: {sorted(BABYBABEL_CONFIGS)}")
+
+    cfg = BABYBABEL_CONFIGS[primary_lang]
+    label = "-".join(langs)
+    out_dir = Path(f"tokenizer-babybabel-{label}-local")
+    out_dir.mkdir(exist_ok=True)
+
+    print(f"\n--- Training BabyBabel tokenizer: {label} ({len(langs)} lang(s)) ---")
+    print(f"  Languages: {[BABYBABEL_CONFIGS[l]['name'] for l in langs]}")
+    print(f"  Vocab size: {vocab_size:,}")
+    print(f"  Max sentences/lang: {max_sentences_per_lang:,}")
+
+    tokenizer = build_tokenizer(cfg)
+    trainer = build_trainer(cfg, vocab_size)
+
+    total_sentences = max_sentences_per_lang * len(langs)
+    progress_iterator = tqdm(
+        get_babybabel_corpus(langs, max_sentences_per_lang),
+        total=total_sentences,
+        desc=f"Training ({label})",
+        unit=" sentences",
+        colour="cyan",
+    )
+    tokenizer.train_from_iterator(progress_iterator, trainer=trainer)
+
+    print(f"\nTraining finished. Saving files...")
+
+    hf_tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=tokenizer,
+        bos_token="<s>",
+        eos_token="</s>",
+        pad_token="<pad>",
+        unk_token="<unk>",
+        clean_up_tokenization_spaces=cfg.get("clean_up_spaces", False),
+    )
+
+    hf_tokenizer.save_pretrained(out_dir)
+    print(f"Local files saved to: {out_dir}")
+
+    hf_token = os.environ.get("HF_TOKEN")
+    if hf_token:
+        print(f"Pushing to Hub: {hf_repo}...")
+        create_repo(hf_repo, exist_ok=True, token=hf_token)
+        hf_tokenizer.push_to_hub(hf_repo, token=hf_token)
+        print(f"Pushed successfully: {hf_repo}")
+    else:
+        print("Skipping Hub push (HF_TOKEN not found in environment).")
+
+    return hf_tokenizer
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--lang", required=True, choices=sorted(LANG_CONFIGS))
-    parser.add_argument("--hf-user", default="Beetle-Data")
-    parser.add_argument("--vocab-size", type=int, default=50000)
-    parser.add_argument("--sentences", type=int, default=2000000)
+
+    sub = parser.add_subparsers(dest="mode")
+
+    # FineWeb mode (original)
+    fw = sub.add_parser("fineweb", help="Train FineWeb bilingual tokenizer")
+    fw.add_argument("--lang", required=True, choices=sorted(LANG_CONFIGS))
+    fw.add_argument("--hf-user", default="Beetle-Data")
+    fw.add_argument("--vocab-size", type=int, default=50000)
+    fw.add_argument("--sentences", type=int, default=2000000)
+
+    # BabyBabel mode (new)
+    bb = sub.add_parser("babybabel", help="Train BabyBabel mono/bi/trilingual tokenizer")
+    bb.add_argument("--langs", nargs="+", required=True,
+                    help="Language codes (e.g., eng nld OR eng nld zho)")
+    bb.add_argument("--hf-repo", required=True,
+                    help="Full HF repo ID (e.g., Beetle-HumanScale/bpe-humanscale-eng-nld)")
+    bb.add_argument("--vocab-size", type=int, default=50000)
+    bb.add_argument("--max-sentences", type=int, default=500000,
+                    help="Max sentences per language for training")
+
     args = parser.parse_args()
 
-    train_and_push(
-        lang=args.lang,
-        hf_user=args.hf_user,
-        vocab_size=args.vocab_size,
-        n_sentences=args.sentences,
-    )
+    if args.mode == "babybabel":
+        train_babybabel_tokenizer(
+            langs=args.langs,
+            hf_repo=args.hf_repo,
+            vocab_size=args.vocab_size,
+            max_sentences_per_lang=args.max_sentences,
+        )
+    elif args.mode == "fineweb":
+        train_and_push(
+            lang=args.lang,
+            hf_user=args.hf_user,
+            vocab_size=args.vocab_size,
+            n_sentences=args.sentences,
+        )
+    else:
+        # Backward compatibility: default to FineWeb mode with --lang
+        parser.add_argument("--lang", required=True, choices=sorted(LANG_CONFIGS))
+        parser.add_argument("--hf-user", default="Beetle-Data")
+        parser.add_argument("--vocab-size", type=int, default=50000)
+        parser.add_argument("--sentences", type=int, default=2000000)
+        args = parser.parse_args()
+        train_and_push(
+            lang=args.lang,
+            hf_user=args.hf_user,
+            vocab_size=args.vocab_size,
+            n_sentences=args.sentences,
+        )
 
 
 if __name__ == "__main__":
