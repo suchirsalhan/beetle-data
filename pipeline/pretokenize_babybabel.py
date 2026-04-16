@@ -46,6 +46,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import functools
 import json
 import logging
 import os
@@ -173,55 +174,107 @@ def tri_dataset_repo(lang: str, l1: str, l2: str, l3: str, target: str = "33M") 
 # Tokenizer auto-detection
 # =============================================================================
 
-def ensure_mono_tokenizer(lang: str) -> None:
-    """Check if monolingual tokenizer exists on HF; train and push if missing."""
+# A tokenizer trained on a set of languages is equivalent regardless of the
+# order the language codes appear in the repo name. For example,
+# `bpe-humanscale-bul-eng` and `bpe-humanscale-eng-bul` are the same tokenizer.
+# We list all existing tokenizers in the HF_ORG once and reuse any equivalent
+# repo rather than redundantly training and pushing a "canonical" copy.
+
+@functools.lru_cache(maxsize=1)
+def _list_existing_tokenizers() -> Dict[frozenset, str]:
+    """Return {frozenset(langs): repo_id} for every bpe-humanscale-* model in HF_ORG.
+
+    Queries HuggingFace once per process. On failure (offline, auth), returns
+    an empty dict so the caller falls back to a direct load check.
+    """
+    try:
+        from huggingface_hub import HfApi
+
+        api = HfApi()
+        models = api.list_models(author=HF_ORG)
+        out: Dict[frozenset, str] = {}
+        prefix = "bpe-humanscale-"
+        for m in models:
+            repo_id = m.modelId if hasattr(m, "modelId") else m.id
+            name = repo_id.split("/")[-1]
+            if not name.startswith(prefix):
+                continue
+            langs = frozenset(name[len(prefix):].split("-"))
+            # If multiple orderings somehow exist, keep the first encountered.
+            out.setdefault(langs, repo_id)
+        log.info("Discovered %d existing tokenizers in %s", len(out), HF_ORG)
+        return out
+    except Exception as e:
+        log.warning("Could not list tokenizers in %s (%s). Falling back to direct load.", HF_ORG, e)
+        return {}
+
+
+def _find_equivalent_tokenizer(langs: List[str]) -> Optional[str]:
+    """Return repo_id of any existing tokenizer trained on exactly these langs, else None."""
+    key = frozenset(langs)
+    return _list_existing_tokenizers().get(key)
+
+
+def _ensure_tokenizer(langs: List[str], canonical_repo: str, label: str) -> str:
+    """Return a usable tokenizer repo for `langs`, training canonical_repo only if no equivalent exists.
+
+    Checks the HF_ORG listing for any tokenizer trained on exactly the same set
+    of languages (any ordering), avoiding redundant retraining of equivalent
+    tokenizers. Falls back to a direct load of `canonical_repo` if listing fails.
+    """
     from transformers import PreTrainedTokenizerFast
 
-    repo = mono_tokenizer_repo(lang)
+    existing = _find_equivalent_tokenizer(langs)
+    if existing:
+        if existing != canonical_repo:
+            log.info("Reusing equivalent tokenizer: %s (canonical would be %s)",
+                     existing, canonical_repo)
+        else:
+            log.info("Tokenizer found: %s", existing)
+        return existing
+
+    # Listing returned nothing for this set — either genuinely missing, or
+    # listing failed. Try a direct load as a last check before training.
     try:
-        PreTrainedTokenizerFast.from_pretrained(repo)
-        log.info("Tokenizer found: %s", repo)
+        PreTrainedTokenizerFast.from_pretrained(canonical_repo)
+        log.info("Tokenizer found: %s", canonical_repo)
+        return canonical_repo
     except OSError:
-        log.warning("Tokenizer %s not found. Training automatically...", repo)
+        log.warning("Tokenizer %s not found. Training automatically...", canonical_repo)
         _train_babybabel_tokenizer(
-            langs=[lang], hf_repo=repo,
-            label=f"monolingual {lang}",
+            langs=sorted(langs), hf_repo=canonical_repo, label=label,
         )
-        log.info("Tokenizer trained and pushed: %s", repo)
+        log.info("Tokenizer trained and pushed: %s", canonical_repo)
+        # Invalidate the cache so subsequent calls see the new tokenizer.
+        _list_existing_tokenizers.cache_clear()
+        return canonical_repo
 
 
-def ensure_bilingual_tokenizer(l1: str, l2: str) -> None:
-    """Check if bilingual tokenizer exists on HF; train and push if missing."""
-    from transformers import PreTrainedTokenizerFast
-
-    repo = bilingual_tokenizer_repo(l1, l2)
-    try:
-        PreTrainedTokenizerFast.from_pretrained(repo)
-        log.info("Tokenizer found: %s", repo)
-    except OSError:
-        log.warning("Tokenizer %s not found. Training automatically...", repo)
-        _train_babybabel_tokenizer(
-            langs=sorted([l1, l2]), hf_repo=repo,
-            label=f"bilingual {l1}-{l2}",
-        )
-        log.info("Tokenizer trained and pushed: %s", repo)
+def ensure_mono_tokenizer(lang: str) -> str:
+    """Return repo for a monolingual tokenizer, training if no equivalent exists."""
+    return _ensure_tokenizer(
+        langs=[lang],
+        canonical_repo=mono_tokenizer_repo(lang),
+        label=f"monolingual {lang}",
+    )
 
 
-def ensure_trilingual_tokenizer(l1: str, l2: str, l3: str) -> None:
-    """Check if trilingual tokenizer exists on HF; train and push if missing."""
-    from transformers import PreTrainedTokenizerFast
+def ensure_bilingual_tokenizer(l1: str, l2: str) -> str:
+    """Return repo for a bilingual tokenizer (any ordering), training if no equivalent exists."""
+    return _ensure_tokenizer(
+        langs=[l1, l2],
+        canonical_repo=bilingual_tokenizer_repo(l1, l2),
+        label=f"bilingual {l1}-{l2}",
+    )
 
-    repo = trilingual_tokenizer_repo(l1, l2, l3)
-    try:
-        PreTrainedTokenizerFast.from_pretrained(repo)
-        log.info("Tokenizer found: %s", repo)
-    except OSError:
-        log.warning("Tokenizer %s not found. Training automatically...", repo)
-        _train_babybabel_tokenizer(
-            langs=sorted([l1, l2, l3]), hf_repo=repo,
-            label=f"trilingual {l1}-{l2}-{l3}",
-        )
-        log.info("Tokenizer trained and pushed: %s", repo)
+
+def ensure_trilingual_tokenizer(l1: str, l2: str, l3: str) -> str:
+    """Return repo for a trilingual tokenizer (any ordering), training if no equivalent exists."""
+    return _ensure_tokenizer(
+        langs=[l1, l2, l3],
+        canonical_repo=trilingual_tokenizer_repo(l1, l2, l3),
+        label=f"trilingual {l1}-{l2}-{l3}",
+    )
 
 
 def _train_babybabel_tokenizer(
@@ -399,8 +452,7 @@ def pretokenize_mono(
 
     Output: Beetle-HumanScale/{lang}-{target} (e.g., Beetle-HumanScale/nld-100M)
     """
-    ensure_mono_tokenizer(lang)
-    tok_repo = mono_tokenizer_repo(lang)
+    tok_repo = ensure_mono_tokenizer(lang)
     ds_repo = mono_dataset_repo(lang, target)
 
     return pretokenize_one(
@@ -442,8 +494,7 @@ def pretokenize_pair(
     if l2_target is None:
         l2_target = l1_target
 
-    ensure_bilingual_tokenizer(l1, l2)
-    tok_repo = bilingual_tokenizer_repo(l1, l2)
+    tok_repo = ensure_bilingual_tokenizer(l1, l2)
 
     # Map targets to languages (not positions) so iteration order is irrelevant
     targets = {l1: l1_target, l2: l2_target}
@@ -484,8 +535,7 @@ def pretokenize_triple(
       - Beetle-HumanScale/nld-33M-eng-nld-zho
       - Beetle-HumanScale/zho-33M-eng-nld-zho
     """
-    ensure_trilingual_tokenizer(l1, l2, l3)
-    tok_repo = trilingual_tokenizer_repo(l1, l2, l3)
+    tok_repo = ensure_trilingual_tokenizer(l1, l2, l3)
 
     results = []
     for lang in sorted(set([l1, l2, l3])):
