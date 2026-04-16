@@ -15,10 +15,9 @@ Output format matches beetlelm/src/bilingual/data/pretokenize.py exactly:
 Naming conventions (FineWeb-aligned, pushed to Beetle-HumanScale):
   Monolingual:  Beetle-HumanScale/{lang}-{target}
                 e.g. Beetle-HumanScale/nld-100M
-  Bilingual L1: Beetle-HumanScale/{l1}-{target}-{tok_pair}
+  Bilingual:    Beetle-HumanScale/{lang}-{target}-{tok_pair}
                 e.g. Beetle-HumanScale/nld-50M-eng-nld
-  Bilingual L2: Beetle-HumanScale/{l2}-for-{l1}-{target}-{tok_pair}
-                e.g. Beetle-HumanScale/eng-for-nld-50M-eng-nld
+                     Beetle-HumanScale/eng-50M-eng-nld
   Trilingual:   Beetle-HumanScale/{lang}-{target}-{tok_triple}
                 e.g. Beetle-HumanScale/nld-33M-eng-nld-zho
 
@@ -149,22 +148,16 @@ def mono_dataset_repo(lang: str, target: str = "100M") -> str:
     return f"{HF_ORG}/{lang}-{target}"
 
 
-def l1_dataset_repo(l1: str, l2: str, target: str = "50M") -> str:
-    """HF repo for the L1 side of a bilingual pretokenized dataset.
+def bi_dataset_repo(lang: str, l1: str, l2: str, target: str = "50M") -> str:
+    """HF repo for one language side of a bilingual pretokenized dataset.
+
+    Naming is invariant to l1/l2 ordering — the tokenizer pair is always
+    sorted alphabetically, matching the trilingual convention.
 
     Example: Beetle-HumanScale/nld-50M-eng-nld
     """
     tok_pair = "-".join(sorted([l1, l2]))
-    return f"{HF_ORG}/{l1}-{target}-{tok_pair}"
-
-
-def l2_dataset_repo(l1: str, l2: str, target: str = "50M") -> str:
-    """HF repo for the L2 side of a bilingual pretokenized dataset.
-
-    Example: Beetle-HumanScale/eng-for-nld-50M-eng-nld
-    """
-    tok_pair = "-".join(sorted([l1, l2]))
-    return f"{HF_ORG}/{l2}-for-{l1}-{target}-{tok_pair}"
+    return f"{HF_ORG}/{lang}-{target}-{tok_pair}"
 
 
 def tri_dataset_repo(lang: str, l1: str, l2: str, l3: str, target: str = "33M") -> str:
@@ -432,15 +425,18 @@ def pretokenize_pair(
 ) -> List[dict]:
     """Pretokenize both languages of a bilingual pair.
 
-    For pair (l1=nld, l2=eng), produces:
-      - Beetle-HumanScale/nld-50M-eng-nld  (L1: Dutch text, eng-nld tokenizer)
-      - Beetle-HumanScale/eng-for-nld-50M-eng-nld  (L2: English text for Dutch pair)
+    Output is invariant to argument order: pretokenize_pair(nld, eng) and
+    pretokenize_pair(eng, nld) produce the same datasets.
+
+    For pair (nld, eng), produces:
+      - Beetle-HumanScale/eng-50M-eng-nld  (English text, eng-nld tokenizer)
+      - Beetle-HumanScale/nld-50M-eng-nld  (Dutch text, eng-nld tokenizer)
 
     Args:
-        l1: First language (L1).
-        l2: Second language (L2).
-        l1_target: Token target for L1 side (default "50M").
-        l2_target: Token target for L2 side (default: same as l1_target).
+        l1: First language.
+        l2: Second language.
+        l1_target: Token target for l1 (default "50M").
+        l2_target: Token target for l2 (default: same as l1_target).
                    Use different targets for B4 classroom (e.g., l1="80M", l2="20M").
     """
     if l2_target is None:
@@ -449,25 +445,18 @@ def pretokenize_pair(
     ensure_bilingual_tokenizer(l1, l2)
     tok_repo = bilingual_tokenizer_repo(l1, l2)
 
+    # Map targets to languages (not positions) so iteration order is irrelevant
+    targets = {l1: l1_target, l2: l2_target}
+
     results = []
-
-    # L1 side
-    ds_repo_l1 = l1_dataset_repo(l1, l2, l1_target)
-    stats_l1 = pretokenize_one(
-        lang=l1, tokenizer_repo_id=tok_repo, dataset_repo_id=ds_repo_l1,
-        target=l1_target, output_dir=output_dir, upload=upload,
-        cleanup_local=cleanup_local,
-    )
-    results.append(stats_l1)
-
-    # L2 side
-    ds_repo_l2 = l2_dataset_repo(l1, l2, l2_target)
-    stats_l2 = pretokenize_one(
-        lang=l2, tokenizer_repo_id=tok_repo, dataset_repo_id=ds_repo_l2,
-        target=l2_target, output_dir=output_dir, upload=upload,
-        cleanup_local=cleanup_local,
-    )
-    results.append(stats_l2)
+    for lang in sorted(set([l1, l2])):
+        ds_repo = bi_dataset_repo(lang, l1, l2, targets[lang])
+        stats = pretokenize_one(
+            lang=lang, tokenizer_repo_id=tok_repo, dataset_repo_id=ds_repo,
+            target=targets[lang], output_dir=output_dir, upload=upload,
+            cleanup_local=cleanup_local,
+        )
+        results.append(stats)
 
     return results
 
