@@ -191,6 +191,76 @@ Supported languages and tokenizer types are defined in `tok/multi-train-tok.py:L
 
 ---
 
+## Human-Scale BabyBabel Pretokenization
+
+Pretokenizes BabyBabel raw text for human-scale bilingual experiments in BeetleLM. Produces Arrow datasets compatible with `beetlelm`'s `PretokenizedMultilingualDataset` and pushes them to `Beetle-Data/` on HuggingFace Hub.
+
+### Why pretokenize in beetle-data?
+
+Human-scale experiments (Experiment 1) run hundreds of sweep configs. Without pretokenization, each training run re-tokenizes the same BabyBabel text on-the-fly. Pretokenizing once in beetle-data and loading from HF (`pretokenized_source: "hf_arrow"`) eliminates this overhead across all runs.
+
+### Input / Output
+
+| | Description |
+|---|---|
+| **Input** | Raw text from `BabyLM-community/babylm-{lang}` (9 languages: zho, fas, eng, nld, bul, fra, ind, deu, ukr) |
+| **Tokenizer** | `Beetle-HumanScale/bpe-humanscale-{l1}-{l2}` (36 bilingual pairs, trained by `beetlelm/script/run_tokenizers.sh`) |
+| **Output** | `Beetle-Data/BabyBabel-{lang}-{target}-{l1}-{l2}` Arrow datasets with `input_ids` column (chunk_len=513) |
+| **Format** | Exactly matches `beetlelm/src/bilingual/data/pretokenize.py`: `encode(text, add_special_tokens=False)`, pack into 513-token chunks, no cross-document token bleeding |
+
+Since tokenizers are bilingual, the same raw text tokenized with different pair tokenizers produces different `input_ids`. Each output dataset encodes the tokenizer used in its name (e.g., `BabyBabel-nld-50M-eng-nld` = Dutch text tokenized with the eng-nld tokenizer).
+
+### Usage
+
+```bash
+# Single pair (produces 2 Arrow datasets: one per language)
+python -m pipeline.pretokenize_babybabel --pair eng nld
+
+# 3 pilot pairs: nld-eng, zho-eng, zho-nld (6 datasets)
+python -m pipeline.pretokenize_babybabel --pilot
+
+# All 36 pairs (72 Arrow datasets)
+python -m pipeline.pretokenize_babybabel --all
+
+# Skip HuggingFace upload (local Arrow only)
+python -m pipeline.pretokenize_babybabel --all --no-upload
+
+# Custom token target
+python -m pipeline.pretokenize_babybabel --pilot --target 100M
+```
+
+### SLURM Submission
+
+Human-scale data is small (~50M tokens/lang), so a single node suffices:
+
+```bash
+# All 36 pairs (under 1 hour)
+sbatch scripts/launch_pretokenize_babybabel.sh
+
+# Pilot only
+MODE=pilot sbatch scripts/launch_pretokenize_babybabel.sh
+
+# Single pair
+L1=eng L2=nld sbatch scripts/launch_pretokenize_babybabel.sh
+```
+
+### Integration with BeetleLM
+
+BeetleLM training configs reference these datasets with `pretokenized_source: "hf_arrow"`:
+
+```yaml
+# In a beetlelm training config:
+data:
+  lang_sources: ["Beetle-Data/BabyBabel-nld-50M-eng-nld"]
+  l2_streams: ["Beetle-Data/BabyBabel-eng-50M-eng-nld"]
+  pretokenized: true
+  pretokenized_source: "hf_arrow"
+```
+
+The config generator (`beetlelm/configs/generate_human_scale_bilingual.py`) produces these references automatically. Run pretokenization **before** launching training jobs.
+
+---
+
 ## Execution: 4-Node Cluster
 
 All four steps below are designed for 4 nodes of 8 × A100-80GB GPUs each with a shared filesystem (e.g., `/mnt/ssd-3`).
