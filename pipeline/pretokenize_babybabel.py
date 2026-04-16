@@ -1,7 +1,7 @@
 """
 pretokenize_babybabel.py — Pretokenize BabyBabel human-scale data for BeetleLM.
 
-Reads raw text from BabyLM-community HuggingFace datasets (9 languages),
+Reads raw text from Beetle-Data HuggingFace datasets (9 languages × 11 targets),
 tokenizes with mono/bilingual/trilingual tokenizers from Beetle-HumanScale,
 packs into 513-token Arrow sequences, and pushes to Beetle-HumanScale on
 HuggingFace Hub.
@@ -71,18 +71,17 @@ HF_ORG = "Beetle-HumanScale"
 
 CHUNK_LEN = 513  # seq_len(512) + 1 label token
 
-# BabyBabel raw text sources (BabyLM community datasets)
-BABYBABEL_SOURCES: Dict[str, str] = {
-    "zho": "BabyLM-community/babylm-zho",
-    "fas": "BabyLM-community/babylm-fas",
-    "eng": "BabyLM-community/babylm-eng",
-    "nld": "BabyLM-community/babylm-nld",
-    "bul": "BabyLM-community/babylm-bul",
-    "fra": "BabyLM-community/babylm-fra",
-    "ind": "BabyLM-community/babylm-ind",
-    "deu": "BabyLM-community/babylm-deu",
-    "ukr": "BabyLM-community/babylm-ukr",
-}
+# BabyBabel raw text sources (Beetle-Data HuggingFace org, per-target datasets)
+BABYBABEL_SOURCE_ORG = "Beetle-Data"
+BABYBABEL_LANGS = {"zho", "fas", "eng", "nld", "bul", "fra", "ind", "deu", "ukr"}
+
+
+def babybabel_source_repo(lang: str, target: str) -> str:
+    """HF repo for BabyBabel raw text at a given target size.
+
+    Example: Beetle-Data/BabyBabel-ukr-100M
+    """
+    return f"{BABYBABEL_SOURCE_ORG}/BabyBabel-{lang}-{target}"
 
 # Token targets (name → token count)
 TARGETS: Dict[str, int] = {
@@ -240,7 +239,7 @@ def _train_babybabel_tokenizer(
 ) -> None:
     """Train a BPE tokenizer on BabyBabel data and push to HF Hub.
 
-    Streams text from BabyLM-community datasets for the specified languages,
+    Streams text from Beetle-Data datasets for the specified languages,
     allocating training data equally across languages.
     """
     import importlib.util
@@ -295,7 +294,7 @@ def pretokenize_one(
     from datasets import Dataset, load_dataset
     from transformers import PreTrainedTokenizerFast
 
-    source_repo = BABYBABEL_SOURCES[lang]
+    source_repo = babybabel_source_repo(lang, target)
 
     # Use the dataset repo name (without org prefix) as local dir name
     local_name = dataset_repo_id.split("/")[-1] if "/" in dataset_repo_id else dataset_repo_id
@@ -636,8 +635,8 @@ def main():
     if args.mono:
         if not args.lang:
             parser.error("--mono requires --lang")
-        if args.lang not in BABYBABEL_SOURCES:
-            parser.error(f"Unknown language: {args.lang}. Available: {list(BABYBABEL_SOURCES.keys())}")
+        if args.lang not in BABYBABEL_LANGS:
+            parser.error(f"Unknown language: {args.lang}. Available: {sorted(BABYBABEL_LANGS)}")
         target = args.target or "100M"
         if target not in TARGETS:
             parser.error(f"Unknown target: {target}. Available: {list(TARGETS.keys())}")
@@ -646,8 +645,8 @@ def main():
     elif args.pair:
         l1, l2 = args.pair
         for lang in [l1, l2]:
-            if lang not in BABYBABEL_SOURCES:
-                parser.error(f"Unknown language: {lang}. Available: {list(BABYBABEL_SOURCES.keys())}")
+            if lang not in BABYBABEL_LANGS:
+                parser.error(f"Unknown language: {lang}. Available: {sorted(BABYBABEL_LANGS)}")
         l1_target = args.l1_target or args.target or "50M"
         l2_target = args.l2_target or args.target or "50M"
         results = pretokenize_pair(l1, l2, l1_target, l2_target, args.output_dir, upload, args.cleanup)
@@ -655,8 +654,8 @@ def main():
     elif args.triple:
         l1, l2, l3 = args.triple
         for lang in [l1, l2, l3]:
-            if lang not in BABYBABEL_SOURCES:
-                parser.error(f"Unknown language: {lang}. Available: {list(BABYBABEL_SOURCES.keys())}")
+            if lang not in BABYBABEL_LANGS:
+                parser.error(f"Unknown language: {lang}. Available: {sorted(BABYBABEL_LANGS)}")
         target = args.target or "33M"
         results = pretokenize_triple(l1, l2, l3, target, args.output_dir, upload, args.cleanup)
 
