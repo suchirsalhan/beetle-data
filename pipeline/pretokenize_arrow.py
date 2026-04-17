@@ -717,6 +717,11 @@ def pretokenize_pair_curriculum(
 def main():
     global ARROW_FLUSH_CHUNKS
 
+    # Disable HF tokenizer internal thread pool before any multiprocessing Pool
+    # spawns workers — prevents the "current process just got forked" warnings
+    # and rank-style deadlocks when running with a high NUM_WORKERS.
+    os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
     parser = argparse.ArgumentParser(
         description="Stage 3: Read clean Parquet, tokenize, write Arrow."
     )
@@ -732,8 +737,9 @@ def main():
                         help="HuggingFace user/org for tokenizer repos")
     parser.add_argument("--target-tokens", type=int, default=None,
                         help="Override total target tokens per side")
-    parser.add_argument("--num-workers", type=int, default=24,
-                        help="Number of multiprocessing workers")
+    parser.add_argument("--num-workers", type=int, default=None,
+                        help="Number of multiprocessing workers "
+                             "(default: auto-detect = min(cpu_count - 4, 64))")
     parser.add_argument("--seq-len", type=int, default=512,
                         help="Sequence length (default: 512, chunk = seq_len + 1)")
     parser.add_argument("--flush-chunks", type=int, default=ARROW_FLUSH_CHUNKS,
@@ -758,10 +764,10 @@ def main():
         parser.error("Must specify --lang or --node-id")
         return
 
-    cfg = PipelineConfig(
+    # Only pass num_workers when explicitly set, else use PipelineConfig auto-detect
+    cfg_kwargs = dict(
         output_dir=args.output_dir,
         hf_user=args.hf_user,
-        num_workers=args.num_workers,
         seq_len=args.seq_len,
         chunk_len=args.seq_len + 1,
         upload_to_hf=not args.no_upload,
@@ -769,6 +775,9 @@ def main():
         cleanup_stage2_after_pretok=not args.no_cleanup,
         hf_dataset_suffix=args.dataset_suffix,
     )
+    if args.num_workers is not None:
+        cfg_kwargs["num_workers"] = args.num_workers
+    cfg = PipelineConfig(**cfg_kwargs)
 
     all_stats = {}
     for lang in languages:

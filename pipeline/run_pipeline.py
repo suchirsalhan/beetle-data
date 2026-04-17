@@ -328,8 +328,9 @@ Examples:
                         help="Path to pre-built benchmark_13gram.pkl (skips Stage 1)")
     parser.add_argument("--hf-user", type=str, default="Beetle-Data",
                         help="HuggingFace user/org")
-    parser.add_argument("--num-workers", type=int, default=24,
-                        help="Multiprocessing workers per stage")
+    parser.add_argument("--num-workers", type=int, default=None,
+                        help="Multiprocessing workers per stage "
+                             "(default: auto-detect = min(cpu_count - 4, 64))")
     parser.add_argument("--target-words", type=int, default=None,
                         help="Override target words per language")
     parser.add_argument("--seq-len", type=int, default=512,
@@ -377,12 +378,11 @@ Examples:
 
     upload_raw = args.upload_raw_parquet or args.curriculum_prep
 
-    # Build config
-    cfg = PipelineConfig(
+    # Build config — only pass num_workers when explicitly set, else use auto-detect
+    cfg_kwargs = dict(
         project_root=args.project_root,
         output_dir=args.output_dir,
         hf_user=args.hf_user,
-        num_workers=args.num_workers,
         seq_len=args.seq_len,
         chunk_len=args.seq_len + 1,
         upload_to_hf=not args.no_upload,
@@ -391,6 +391,9 @@ Examples:
         cleanup_stage2_after_pretok=not args.no_cleanup,
         hf_dataset_suffix=args.dataset_suffix,
     )
+    if args.num_workers is not None:
+        cfg_kwargs["num_workers"] = args.num_workers
+    cfg = PipelineConfig(**cfg_kwargs)
     if args.target_words:
         cfg.stream_words_per_lang = args.target_words
 

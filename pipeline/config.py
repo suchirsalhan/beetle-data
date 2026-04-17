@@ -13,8 +13,23 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
+from multiprocessing import cpu_count as _cpu_count
 from pathlib import Path
 from typing import Dict, List, Optional
+
+
+def _default_num_workers() -> int:
+    """Auto-detect worker count: leave 4 cores free, hard cap at 64.
+
+    The cap avoids IPC queue contention in multiprocessing.Pool.imap(chunksize=1)
+    in pretokenize_arrow.py, and limits peak memory from the per-worker
+    tokenizer copy. Override explicitly with --num-workers or NUM_WORKERS env var.
+    """
+    try:
+        n = _cpu_count()
+    except NotImplementedError:
+        n = 8
+    return max(1, min(n - 4, 64))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -407,7 +422,7 @@ class PipelineConfig:
     max_local_disk_gb: int = 1000           # pre-flight check: abort if less than this free
 
     # Parallelization
-    num_workers: int = 24
+    num_workers: int = field(default_factory=_default_num_workers)
     shard_size: int = 50_000    # docs per Parquet shard
     batch_size: int = 1_000     # docs per worker batch
 

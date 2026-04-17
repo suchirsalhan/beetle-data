@@ -39,7 +39,9 @@ BEETLE_DATA="$(cd "$SCRIPT_DIR/.." && pwd)"
 PROJECT_ROOT="${PROJECT_ROOT:-$(cd "$BEETLE_DATA/.." && pwd)}"
 OUTPUT_DIR="${OUTPUT_DIR:-${BEETLE_DATA}/pipeline_output}"
 HF_USER="${HF_USER:-Beetle-Data}"
-NUM_WORKERS="${NUM_WORKERS:-24}"
+# NUM_WORKERS defaults to empty — PipelineConfig auto-detects min(cpu_count - 4, 64).
+# Set the env var (e.g. NUM_WORKERS=48) to override.
+NUM_WORKERS="${NUM_WORKERS:-}"
 
 cd "$BEETLE_DATA"
 
@@ -61,7 +63,7 @@ print(f'  datasets={datasets.__version__}  pyarrow={pyarrow.__version__}  transf
 echo "============================================================"
 echo "Beetle-Data Pipeline: STEP 1 — Static Pipeline (Stages 1+2+3)"
 echo "  Output dir:     $OUTPUT_DIR"
-echo "  Workers:        $NUM_WORKERS"
+echo "  Workers:        ${NUM_WORKERS:-auto (min(cpu_count - 4, 64))}"
 echo "  Stream target:  28B clean tokens per language side"
 echo "  Train target:   24B tokens per bilingual pair (12B L1 + 12B EN)"
 echo "  Peak disk:      ~320 GB (with HF upload + cleanup)"
@@ -74,12 +76,19 @@ echo ""
 # Pass all arguments through to the Python orchestrator.
 # --skip-disk-check suppresses the pre-flight disk check (adjust via
 # max_local_disk_gb in PipelineConfig if you need a tighter guard).
+# Only forward --num-workers when the env var is explicitly set; otherwise
+# PipelineConfig auto-detects based on cpu_count().
+EXTRA_ARGS=()
+if [ -n "$NUM_WORKERS" ]; then
+    EXTRA_ARGS+=(--num-workers "$NUM_WORKERS")
+fi
+
 python -m pipeline.run_pipeline \
     --project-root "$PROJECT_ROOT" \
     --output-dir "$OUTPUT_DIR" \
     --hf-user "$HF_USER" \
-    --num-workers "$NUM_WORKERS" \
     --skip-disk-check \
+    "${EXTRA_ARGS[@]}" \
     "$@"
 
 echo ""

@@ -37,6 +37,7 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from .config import _default_num_workers
 from .heuristic_filters import HeuristicConfig, passes_heuristics
 
 logging.basicConfig(
@@ -360,7 +361,7 @@ class IndexConfig:
     """Configuration for scoring and indexing."""
     n_clusters: int = 200
     shard_size: int = 10_000
-    num_workers: int = 24
+    num_workers: int = field(default_factory=_default_num_workers)
     embedding_batch_size: int = 256
     upload_to_hf: bool = True
     hf_user: str = "Beetle-Data"
@@ -544,7 +545,9 @@ def main():
     parser.add_argument("--node-id", type=int, default=None)
     parser.add_argument("--n-clusters", type=int, default=200)
     parser.add_argument("--shard-size", type=int, default=10_000)
-    parser.add_argument("--num-workers", type=int, default=24)
+    parser.add_argument("--num-workers", type=int, default=None,
+                        help="Number of multiprocessing workers "
+                             "(default: auto-detect = min(cpu_count - 4, 64))")
     args = parser.parse_args()
 
     if args.lang:
@@ -560,11 +563,13 @@ def main():
             log.error("No decontaminated data found")
             return
 
-    cfg = IndexConfig(
+    cfg_kwargs = dict(
         n_clusters=args.n_clusters,
         shard_size=args.shard_size,
-        num_workers=args.num_workers,
     )
+    if args.num_workers is not None:
+        cfg_kwargs["num_workers"] = args.num_workers
+    cfg = IndexConfig(**cfg_kwargs)
 
     score_and_index_all(langs, args.output_dir, cfg)
 

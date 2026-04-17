@@ -399,14 +399,18 @@ def decontaminate_language(
 
 
 def _upload_raw_parquet(out_dir: "Path", lang: str, cfg: "PipelineConfig") -> None:
-    """Upload raw decontaminated Parquet shards to HuggingFace.
+    """Upload raw decontaminated Parquet shards to HuggingFace in one batched commit.
 
     Uploads to: {hf_user}/{lang}-raw-{hf_dataset_suffix}
     This allows curriculum Stage D nodes to download raw shards without
     needing a shared filesystem with the decontamination nodes.
+
+    Uses `upload_large_folder` (huggingface_hub >= 0.26) so the entire folder is
+    pushed in a small number of batched commits (not one commit per shard),
+    staying well under HF's 128-commits-per-hour per-repo rate limit.
+    Falls back to `upload_folder` on older hub versions.
     """
     from huggingface_hub import HfApi
-    import glob as _glob
 
     raw_repo = cfg.hf_raw_parquet_repo(lang)
     api = HfApi(token=cfg.hf_token or None)
@@ -419,21 +423,40 @@ def _upload_raw_parquet(out_dir: "Path", lang: str, cfg: "PipelineConfig") -> No
         return
 
     parquet_files = sorted(out_dir.glob("*.parquet"))
-    manifest_file = out_dir / f"{lang}_manifest.json"
-    stats_file = out_dir / f"{lang}_stats.json"
+    allow_patterns = [
+        "*.parquet",
+        f"{lang}_manifest.json",
+        f"{lang}_stats.json",
+    ]
 
-    log.info("Uploading %d raw Parquet shards to %s ...", len(parquet_files), raw_repo)
-    for fpath in [*parquet_files, manifest_file, stats_file]:
-        if fpath.exists():
-            try:
-                api.upload_file(
-                    path_or_fileobj=str(fpath),
-                    path_in_repo=fpath.name,
-                    repo_id=raw_repo,
-                    repo_type="dataset",
-                )
-            except Exception as e:
-                log.warning("  Upload failed for %s: %s", fpath.name, e)
+    log.info(
+        "Uploading %d raw Parquet shards to %s via upload_large_folder ...",
+        len(parquet_files), raw_repo,
+    )
+
+    try:
+        if hasattr(api, "upload_large_folder"):
+            api.upload_large_folder(
+                folder_path=str(out_dir),
+                repo_id=raw_repo,
+                repo_type="dataset",
+                allow_patterns=allow_patterns,
+            )
+        else:
+            # Fallback for older huggingface_hub — still batches into one commit
+            log.info(
+                "  upload_large_folder unavailable; falling back to upload_folder"
+            )
+            api.upload_folder(
+                folder_path=str(out_dir),
+                repo_id=raw_repo,
+                repo_type="dataset",
+                allow_patterns=allow_patterns,
+                commit_message=f"Upload raw {lang} Parquet shards ({len(parquet_files)} files)",
+            )
+    except Exception as e:
+        log.warning("Batched upload failed for %s: %s", raw_repo, e)
+        return
 
     log.info("Raw Parquet upload complete → %s", raw_repo)
 
@@ -456,8 +479,9 @@ def main():
                         help="Base output directory")
     parser.add_argument("--target-words", type=int, default=None,
                         help="Override target words per language (default: from config)")
-    parser.add_argument("--num-workers", type=int, default=24,
-                        help="Number of multiprocessing workers")
+    parser.add_argument("--num-workers", type=int, default=None,
+                        help="Number of multiprocessing workers "
+                             "(default: auto-detect = min(cpu_count - 4, 64))")
     parser.add_argument("--shard-size", type=int, default=50_000,
                         help="Documents per Parquet shard")
     parser.add_argument("--upload-raw-parquet", action="store_true",
@@ -478,13 +502,15 @@ def main():
     log.info("Loading benchmark index from %s", args.index)
     index = BenchmarkIndex.load(args.index)
 
-    # Build config
-    cfg = PipelineConfig(
+    # Build config — only pass num_workers when explicitly set, else use auto-detect
+    cfg_kwargs = dict(
         output_dir=args.output_dir,
-        num_workers=args.num_workers,
         shard_size=args.shard_size,
         upload_raw_parquet=args.upload_raw_parquet,
     )
+    if args.num_workers is not None:
+        cfg_kwargs["num_workers"] = args.num_workers
+    cfg = PipelineConfig(**cfg_kwargs)
     if args.target_words:
         cfg.stream_words_per_lang = args.target_words
 
