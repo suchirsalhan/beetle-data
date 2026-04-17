@@ -216,6 +216,9 @@ class ShardWriter:
         self.manifest[fname] = (first_id, last_id)
         self.shard_idx += 1
         self.buffer.clear()
+        # Keep manifest on disk in sync with shards so a crash between shard
+        # flushes still leaves a consistent snapshot for resume.
+        self.save_manifest()
         return str(path)
 
     def save_manifest(self) -> str:
@@ -224,6 +227,25 @@ class ShardWriter:
         with open(manifest_path, "w") as f:
             json.dump(self.manifest, f, indent=2)
         return str(manifest_path)
+
+    def save_checkpoint(self, stats: "DecontaminationStats") -> str:
+        """Persist resume state after a successful batch cycle.
+
+        Written atomically (write-to-tmp + rename) so a crash mid-write
+        can't leave a truncated JSON file. Resume uses stats.docs_streamed
+        as the ds.skip(...) offset.
+        """
+        cp_path = self.output_dir / f"{self.lang}_checkpoint.json"
+        tmp_path = cp_path.with_suffix(".json.tmp")
+        payload = {
+            "shard_idx": self.shard_idx,
+            "next_doc_id": self.next_doc_id,
+            "stats": stats.to_dict(),
+        }
+        with open(tmp_path, "w") as f:
+            json.dump(payload, f, indent=2)
+        os.replace(tmp_path, cp_path)
+        return str(cp_path)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -271,19 +293,57 @@ def decontaminate_language(
     log.info("  Source dataset: %s",
              cfg.training_dataset_en if lc.is_english else cfg.training_dataset_l1)
 
-    # Stream dataset (configurable source — change TRAINING_DATASET_* in config.py)
-    if lc.is_english:
-        ds = load_dataset(cfg.training_dataset_en, split="train", streaming=True)
-    else:
-        ds = load_dataset(cfg.training_dataset_l1, name=lc.fw2_name,
-                          split="train", streaming=True)
-
     # Shard writer
     writer = ShardWriter(out_dir, lang, shard_size=cfg.shard_size)
 
-    # Progress bar
+    # Resume from checkpoint if one exists from a previous (crashed) run.
+    # stats.docs_streamed doubles as the ds.skip(...) offset on resume.
+    checkpoint_path = out_dir / f"{lang}_checkpoint.json"
+    manifest_path = out_dir / f"{lang}_manifest.json"
+    if checkpoint_path.exists():
+        try:
+            with open(checkpoint_path) as f:
+                cp = json.load(f)
+            for k, v in cp.get("stats", {}).items():
+                if hasattr(stats, k):
+                    setattr(stats, k, v)
+            writer.shard_idx = int(cp.get("shard_idx", 0))
+            writer.next_doc_id = int(cp.get("next_doc_id", 0))
+            if manifest_path.exists():
+                with open(manifest_path) as f:
+                    writer.manifest = {
+                        k: tuple(v) for k, v in json.load(f).items()
+                    }
+            log.info("Resuming %s from %d streamed docs, shard %d (accumulated %d words)",
+                     lang, stats.docs_streamed, writer.shard_idx, stats.words_accumulated)
+        except Exception as e:
+            log.warning("Failed to load checkpoint for %s (%s); starting fresh",
+                        lang, e)
+            stats = DecontaminationStats(
+                lang=lang,
+                stream_token_target=cfg.stream_words_per_lang,
+                train_token_target=getattr(cfg, "target_tokens_per_lang", TARGET_TOKENS_PER_LANG),
+            )
+            writer = ShardWriter(out_dir, lang, shard_size=cfg.shard_size)
+
+    skip_count = stats.docs_streamed
+
+    # Stream dataset (configurable source — change TRAINING_DATASET_* in config.py)
+    def _open_stream(skip: int):
+        if lc.is_english:
+            d = load_dataset(cfg.training_dataset_en, split="train", streaming=True)
+        else:
+            d = load_dataset(cfg.training_dataset_l1, name=lc.fw2_name,
+                             split="train", streaming=True)
+        return d.skip(skip) if skip else d
+
+    ds = _open_stream(skip_count)
+
+    # Progress bar — seed with any already-accumulated words so tqdm reflects
+    # resumed progress rather than restarting at 0.
     pbar = tqdm(
         total=target_words,
+        initial=stats.words_accumulated,
         unit="words",
         desc=f"Decontaminating {lang}",
         unit_scale=True,
@@ -296,75 +356,86 @@ def decontaminate_language(
 
     text_field = getattr(cfg, "training_text_field", "text")
 
+    MAX_STREAM_RETRIES = 5
+
+    def _consume_batch(batch_docs: List[Dict], pool) -> None:
+        """Dispatch a batch to workers and fold results into stats + writer."""
+        sub_batches = [
+            batch_docs[i:i + cfg.batch_size]
+            for i in range(0, len(batch_docs), cfg.batch_size)
+        ]
+        results = pool.map(_process_batch, sub_batches, chunksize=1)
+        for sub_result in results:
+            for result in sub_result:
+                stats.docs_streamed += 1
+                if result is None:
+                    continue
+                status = result["status"]
+                if status == "too_short":
+                    stats.docs_too_short += 1
+                elif status == "too_long":
+                    stats.docs_too_long += 1
+                elif status == "contaminated":
+                    stats.docs_contaminated += 1
+                elif status == "clean":
+                    stats.docs_clean += 1
+                    stats.words_accumulated += result["word_count"]
+                    writer.add(result)
+                    pbar.update(result["word_count"])
+
     with Pool(
         processes=num_workers,
         initializer=_init_worker,
         initargs=(index, cfg.min_doc_chars, cfg.max_doc_chars, text_field),
     ) as pool:
 
-        for entry in ds:
-            batch.append({
-                text_field: entry.get(text_field, "") or entry.get("text", ""),
-                "url": entry.get("url", ""),
-            })
+        attempt = 0
+        while True:
+            try:
+                for entry in ds:
+                    batch.append({
+                        text_field: entry.get(text_field, "") or entry.get("text", ""),
+                        "url": entry.get("url", ""),
+                    })
 
-            if len(batch) >= cfg.batch_size * num_workers:
-                # Split into sub-batches and distribute
-                sub_batches = [
-                    batch[i:i + cfg.batch_size]
-                    for i in range(0, len(batch), cfg.batch_size)
-                ]
-                results = pool.map(_process_batch, sub_batches, chunksize=1)
+                    if len(batch) >= cfg.batch_size * num_workers:
+                        _consume_batch(batch, pool)
+                        batch.clear()
 
-                for sub_result in results:
-                    for result in sub_result:
-                        stats.docs_streamed += 1
-                        if result is None:
-                            continue
-                        status = result["status"]
-                        if status == "too_short":
-                            stats.docs_too_short += 1
-                        elif status == "too_long":
-                            stats.docs_too_long += 1
-                        elif status == "contaminated":
-                            stats.docs_contaminated += 1
-                        elif status == "clean":
-                            stats.docs_clean += 1
-                            stats.words_accumulated += result["word_count"]
-                            writer.add(result)
-                            pbar.update(result["word_count"])
+                        # Persist resume state after every full batch cycle.
+                        writer.save_checkpoint(stats)
 
+                        # Check if we've reached the word target
+                        if stats.words_accumulated >= target_words:
+                            break
+                break  # for-loop exhausted normally
+            except (RuntimeError, ConnectionError, OSError) as e:
+                attempt += 1
+                if attempt > MAX_STREAM_RETRIES:
+                    log.error("Exceeded %d stream retries for %s; giving up",
+                              MAX_STREAM_RETRIES, lang)
+                    raise
+                wait = min(60, 2 ** attempt)
+                log.warning("Stream error for %s at %d streamed docs (%s: %s); "
+                            "retry %d/%d in %ds",
+                            lang, stats.docs_streamed, type(e).__name__, e,
+                            attempt, MAX_STREAM_RETRIES, wait)
+                time.sleep(wait)
+                # Entries sitting in `batch` were never folded into
+                # stats.docs_streamed, so discarding them and skipping to
+                # stats.docs_streamed re-yields them on the new stream.
                 batch.clear()
-
-                # Check if we've reached the word target
-                if stats.words_accumulated >= target_words:
-                    break
+                try:
+                    del ds
+                except Exception:
+                    pass
+                ds = _open_stream(stats.docs_streamed)
 
         # Process remaining batch
         if batch and stats.words_accumulated < target_words:
-            sub_batches = [
-                batch[i:i + cfg.batch_size]
-                for i in range(0, len(batch), cfg.batch_size)
-            ]
-            results = pool.map(_process_batch, sub_batches, chunksize=1)
-
-            for sub_result in results:
-                for result in sub_result:
-                    stats.docs_streamed += 1
-                    if result is None:
-                        continue
-                    status = result["status"]
-                    if status == "too_short":
-                        stats.docs_too_short += 1
-                    elif status == "too_long":
-                        stats.docs_too_long += 1
-                    elif status == "contaminated":
-                        stats.docs_contaminated += 1
-                    elif status == "clean":
-                        stats.docs_clean += 1
-                        stats.words_accumulated += result["word_count"]
-                        writer.add(result)
-                        pbar.update(result["word_count"])
+            _consume_batch(batch, pool)
+            batch.clear()
+            writer.save_checkpoint(stats)
 
     pbar.close()
 
@@ -382,6 +453,13 @@ def decontaminate_language(
     stats_path = out_dir / f"{lang}_stats.json"
     with open(stats_path, "w") as f:
         json.dump(stats.to_dict(), f, indent=2)
+
+    # Successful completion → remove checkpoint so the next run starts fresh
+    # instead of spuriously resuming.
+    try:
+        (out_dir / f"{lang}_checkpoint.json").unlink(missing_ok=True)
+    except OSError:
+        pass
 
     log.info("Done %s: %d clean docs, %d contaminated (%.2f%%), %d shards, %.1f min",
              lang, stats.docs_clean, stats.docs_contaminated,
