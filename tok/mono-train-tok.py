@@ -15,6 +15,7 @@ Default: 2,000,000 sentences (matches total data volume of the bilingual tokeniz
 
 import os
 import sys
+import time
 import argparse
 from pathlib import Path
 from tqdm import tqdm
@@ -164,9 +165,24 @@ def train_and_push(
         unit=" sentences",
         colour="cyan",
     )
+    print(
+        "Note: the tqdm bar tracks streaming/ingestion only — sentences fed into the trainer.\n"
+        "After it hits 100%, the Rust BPE trainer still runs merge-table finalization\n"
+        "with NO tqdm movement. This can take many minutes (especially for zh: no whitespace\n"
+        "→ long byte runs under ByteLevel → expensive pair-table construction). This is expected.\n"
+        f"  model=bpe vocab_size={vocab_size} min_frequency={cfg.get('min_freq', 2)} "
+        f"special_tokens=4 n_sentences={n_sentences:,}"
+    )
+    sys.stdout.flush()
+    _train_t0 = time.perf_counter()
     tokenizer.train_from_iterator(progress_iterator, trainer=trainer)
+    _train_elapsed = time.perf_counter() - _train_t0
 
-    print("\nTraining finished. Saving files...")
+    print(
+        f"\nTraining finished. Saving files... "
+        f"Trainer wall-clock: {_train_elapsed:,.1f}s "
+        "(of which post-streaming finalization is the dominant portion for zh)."
+    )
 
     hf_tokenizer = PreTrainedTokenizerFast(
         tokenizer_object=tokenizer,
@@ -179,6 +195,7 @@ def train_and_push(
 
     hf_tokenizer.save_pretrained(out_dir)
     print(f"Local files saved to: {out_dir}")
+    print(f"Final vocab size: {tokenizer.get_vocab_size():,}")
 
     hf_token = os.environ.get("HF_TOKEN")
     if hf_token:
