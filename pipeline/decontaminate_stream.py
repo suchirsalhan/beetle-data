@@ -249,6 +249,71 @@ class ShardWriter:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# Optional lightweight memory logger (gated on BEETLE_MEMLOG=1)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _start_rss_logger(out_dir: Path, lang: str, interval: float = 30.0):
+    """Start a daemon thread that samples parent+worker RSS to a TSV.
+
+    No-op unless the env var BEETLE_MEMLOG=1 is set. Safe to call from a
+    short-lived process: the thread is daemonic, so it dies with the process.
+    Silently skips if psutil is not installed.
+    """
+    if os.environ.get("BEETLE_MEMLOG") != "1":
+        return None
+    try:
+        import psutil  # type: ignore
+    except ImportError:
+        log.warning("BEETLE_MEMLOG=1 set but psutil not installed; skipping")
+        return None
+
+    import threading
+
+    memlog_path = out_dir / f"{lang}_memlog.tsv"
+    parent_pid = os.getpid()
+    header_written = memlog_path.exists()
+
+    def _run():
+        nonlocal header_written
+        try:
+            parent = psutil.Process(parent_pid)
+        except psutil.Error:
+            return
+        while True:
+            try:
+                procs = [parent] + parent.children(recursive=False)
+                ts = time.time()
+                with open(memlog_path, "a") as f:
+                    if not header_written:
+                        f.write(
+                            "ts\tpid\trole\trss_mb\tvms_mb\tnum_fds\tnum_threads\n"
+                        )
+                        header_written = True
+                    for i, p in enumerate(procs):
+                        try:
+                            mi = p.memory_info()
+                            fds = p.num_fds() if hasattr(p, "num_fds") else -1
+                            nth = p.num_threads()
+                            role = "parent" if i == 0 else "worker"
+                            f.write(
+                                f"{ts:.0f}\t{p.pid}\t{role}\t"
+                                f"{mi.rss / 1e6:.1f}\t{mi.vms / 1e6:.1f}\t"
+                                f"{fds}\t{nth}\n"
+                            )
+                        except psutil.Error:
+                            continue
+            except Exception:
+                # Never let the logger crash the pipeline
+                pass
+            time.sleep(interval)
+
+    t = threading.Thread(target=_run, name="beetle-memlog", daemon=True)
+    t.start()
+    log.info("RSS logger active: %s (every %.0fs)", memlog_path, interval)
+    return t
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Main Decontamination Pipeline
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -280,6 +345,9 @@ def decontaminate_language(
     # Output directory
     out_dir = Path(cfg.output_dir) / "decontaminated" / lang
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Optional per-PID RSS logger (no-op unless BEETLE_MEMLOG=1)
+    _start_rss_logger(out_dir, lang)
 
     # Word target: stream until this many CLEAN words are accumulated.
     # Derived from STREAM_TOKENS_PER_LANG ÷ TOKENS_TO_WORDS_RATIO (≈ 21.5B words = 28B tokens).
@@ -356,7 +424,15 @@ def decontaminate_language(
 
     text_field = getattr(cfg, "training_text_field", "text")
 
-    MAX_STREAM_RETRIES = 5
+    # Periodic HF upload cadence (in shards). Every SHARDS_PER_UPLOAD new
+    # shards we push everything in out_dir to the raw repo so a crash never
+    # loses already-committed work. upload_large_folder is resumable — files
+    # that already match the remote are skipped.
+    SHARDS_PER_UPLOAD = int(os.environ.get("BEETLE_SHARDS_PER_UPLOAD", "20"))
+    upload_enabled = (
+        getattr(cfg, "upload_raw_parquet", False) and cfg.upload_to_hf
+    )
+    last_uploaded_shard_idx = writer.shard_idx
 
     def _consume_batch(batch_docs: List[Dict], pool) -> None:
         """Dispatch a batch to workers and fold results into stats + writer."""
@@ -387,49 +463,76 @@ def decontaminate_language(
         processes=num_workers,
         initializer=_init_worker,
         initargs=(index, cfg.min_doc_chars, cfg.max_doc_chars, text_field),
+        maxtasksperchild=200,
     ) as pool:
 
-        attempt = 0
-        while True:
+        # Fail-fast: on any stream error we flush buffered docs, commit a
+        # checkpoint + manifest, optionally push partial shards to HF, then
+        # raise. The outer supervisor (launch_full_pipeline.sh retry loop)
+        # re-invokes Stage 2 in a fresh process, which resumes cleanly via
+        # the checkpoint-loading block above — this is the only reliable way
+        # to release leaked aiohttp/httpx connectors and `datasets` state
+        # that accumulate when retrying in-place inside one long-lived
+        # process (see plan: typed-discovering-swing.md).
+        try:
+            for entry in ds:
+                batch.append({
+                    text_field: entry.get(text_field, "") or entry.get("text", ""),
+                    "url": entry.get("url", ""),
+                })
+
+                if len(batch) >= cfg.batch_size * num_workers:
+                    _consume_batch(batch, pool)
+                    batch.clear()
+
+                    # Persist resume state after every full batch cycle.
+                    writer.save_checkpoint(stats)
+
+                    # Periodic HF upload: every SHARDS_PER_UPLOAD new shards,
+                    # push the out_dir so committed work survives a crash.
+                    if (
+                        upload_enabled
+                        and writer.shard_idx - last_uploaded_shard_idx
+                        >= SHARDS_PER_UPLOAD
+                    ):
+                        try:
+                            _upload_raw_parquet(out_dir, lang, cfg)
+                            last_uploaded_shard_idx = writer.shard_idx
+                        except Exception as up_e:
+                            log.warning(
+                                "Periodic upload for %s failed (will retry "
+                                "next cycle): %s", lang, up_e,
+                            )
+
+                    # Check if we've reached the word target
+                    if stats.words_accumulated >= target_words:
+                        break
+        except BaseException as stream_exc:
+            # Ensure buffered docs become a real shard and manifest on disk
+            # before the process exits, so the resume path finds them.
+            log.error(
+                "Stream error for %s at %d streamed docs (%s: %s) — "
+                "flushing %d buffered docs and exiting for supervisor restart",
+                lang, stats.docs_streamed, type(stream_exc).__name__,
+                stream_exc, len(batch),
+            )
             try:
-                for entry in ds:
-                    batch.append({
-                        text_field: entry.get(text_field, "") or entry.get("text", ""),
-                        "url": entry.get("url", ""),
-                    })
-
-                    if len(batch) >= cfg.batch_size * num_workers:
-                        _consume_batch(batch, pool)
-                        batch.clear()
-
-                        # Persist resume state after every full batch cycle.
-                        writer.save_checkpoint(stats)
-
-                        # Check if we've reached the word target
-                        if stats.words_accumulated >= target_words:
-                            break
-                break  # for-loop exhausted normally
-            except (RuntimeError, ConnectionError, OSError) as e:
-                attempt += 1
-                if attempt > MAX_STREAM_RETRIES:
-                    log.error("Exceeded %d stream retries for %s; giving up",
-                              MAX_STREAM_RETRIES, lang)
-                    raise
-                wait = min(60, 2 ** attempt)
-                log.warning("Stream error for %s at %d streamed docs (%s: %s); "
-                            "retry %d/%d in %ds",
-                            lang, stats.docs_streamed, type(e).__name__, e,
-                            attempt, MAX_STREAM_RETRIES, wait)
-                time.sleep(wait)
-                # Entries sitting in `batch` were never folded into
-                # stats.docs_streamed, so discarding them and skipping to
-                # stats.docs_streamed re-yields them on the new stream.
-                batch.clear()
-                try:
-                    del ds
-                except Exception:
-                    pass
-                ds = _open_stream(stats.docs_streamed)
+                if batch:
+                    _consume_batch(batch, pool)
+                    batch.clear()
+                writer.finalize()
+                writer.save_manifest()
+                writer.save_checkpoint(stats)
+                if upload_enabled and writer.shard_idx > last_uploaded_shard_idx:
+                    try:
+                        _upload_raw_parquet(out_dir, lang, cfg)
+                    except Exception as up_e:
+                        log.warning(
+                            "Crash-path upload for %s failed: %s", lang, up_e,
+                        )
+            except Exception as flush_e:
+                log.error("Crash-path flush for %s failed: %s", lang, flush_e)
+            raise
 
         # Process remaining batch
         if batch and stats.words_accumulated < target_words:
