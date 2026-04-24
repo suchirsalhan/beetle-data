@@ -426,6 +426,14 @@ class PipelineConfig:
     shard_size: int = 50_000    # docs per Parquet shard
     batch_size: int = 1_000     # docs per worker batch
 
+    # Push-and-delete knobs (Chinese-scale safety): bounded per-cycle uploads
+    # plus immediate local deletion so disk stays small and upload cost stays
+    # O(shards_per_upload) instead of O(total shards).
+    shards_per_upload: int = 5         # cycle size; env BEETLE_SHARDS_PER_UPLOAD overrides
+    max_local_shards: int = 30         # hard cap → block streaming if exceeded
+    delete_after_upload: bool = True   # remove local Parquet whose name is on remote
+    resume_mode: str = "state_dict"    # "state_dict" | "skip"
+
     # BeetleStream v2 (curriculum mode)
     stream_mode: str = "static"                           # "static" | "curriculum"
     beetlestream: Optional[BeetleStreamConfig] = None     # None → static mode

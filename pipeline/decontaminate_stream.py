@@ -394,18 +394,37 @@ def decontaminate_language(
             )
             writer = ShardWriter(out_dir, lang, shard_size=cfg.shard_size)
 
-    skip_count = stats.docs_streamed
-
     # Stream dataset (configurable source — change TRAINING_DATASET_* in config.py)
-    def _open_stream(skip: int):
+    def _open_stream():
         if lc.is_english:
-            d = load_dataset(cfg.training_dataset_en, split="train", streaming=True)
-        else:
-            d = load_dataset(cfg.training_dataset_l1, name=lc.fw2_name,
-                             split="train", streaming=True)
-        return d.skip(skip) if skip else d
+            return load_dataset(cfg.training_dataset_en, split="train",
+                                streaming=True)
+        return load_dataset(cfg.training_dataset_l1, name=lc.fw2_name,
+                            split="train", streaming=True)
 
-    ds = _open_stream(skip_count)
+    ds = _open_stream()
+
+    # Resume strategy: prefer IterableDataset.state_dict() (datasets >= 2.17),
+    # which restores the underlying Parquet-file cursor in O(1) rather than
+    # replaying tens of millions of docs via .skip(N). Falls back to .skip()
+    # if the installed `datasets` is too old or the saved state is incompatible.
+    state_path = out_dir / f"{lang}_stream_state.json"
+    resumed_via_state = False
+    if state_path.exists() and getattr(cfg, "resume_mode", "state_dict") == "state_dict":
+        try:
+            with open(state_path) as f:
+                ds.load_state_dict(json.load(f))
+            resumed_via_state = True
+            log.info("Resumed %s via state_dict (shard cursor)", lang)
+        except Exception as e:
+            log.warning(
+                "state_dict resume for %s failed (%s); falling back to skip()",
+                lang, e,
+            )
+
+    if not resumed_via_state and stats.docs_streamed > 0:
+        ds = ds.skip(stats.docs_streamed)
+        log.info("Resumed %s via ds.skip(%d)", lang, stats.docs_streamed)
 
     # Progress bar — seed with any already-accumulated words so tqdm reflects
     # resumed progress rather than restarting at 0.
@@ -424,11 +443,15 @@ def decontaminate_language(
 
     text_field = getattr(cfg, "training_text_field", "text")
 
-    # Periodic HF upload cadence (in shards). Every SHARDS_PER_UPLOAD new
-    # shards we push everything in out_dir to the raw repo so a crash never
-    # loses already-committed work. upload_large_folder is resumable — files
-    # that already match the remote are skipped.
-    SHARDS_PER_UPLOAD = int(os.environ.get("BEETLE_SHARDS_PER_UPLOAD", "20"))
+    # Periodic HF upload cadence (in shards). Every shards_per_upload new
+    # shards we push that batch to the raw repo and delete the local copies
+    # so disk stays bounded. The upload is idempotent across restarts:
+    # _upload_raw_parquet calls list_repo_files first and skips anything
+    # already on the remote.
+    shards_per_upload = int(
+        os.environ.get("BEETLE_SHARDS_PER_UPLOAD", str(cfg.shards_per_upload))
+    )
+    cfg.shards_per_upload = shards_per_upload  # so _upload_raw_parquet sees env override
     upload_enabled = (
         getattr(cfg, "upload_raw_parquet", False) and cfg.upload_to_hf
     )
@@ -488,20 +511,67 @@ def decontaminate_language(
                     # Persist resume state after every full batch cycle.
                     writer.save_checkpoint(stats)
 
-                    # Periodic HF upload: every SHARDS_PER_UPLOAD new shards,
-                    # push the out_dir so committed work survives a crash.
-                    if (
-                        upload_enabled
-                        and writer.shard_idx - last_uploaded_shard_idx
-                        >= SHARDS_PER_UPLOAD
-                    ):
+                    # Snapshot the streaming-dataset cursor atomically so a
+                    # supervisor restart can resume in O(1) via load_state_dict
+                    # instead of replaying millions of docs through .skip().
+                    if hasattr(ds, "state_dict"):
                         try:
-                            _upload_raw_parquet(out_dir, lang, cfg)
-                            last_uploaded_shard_idx = writer.shard_idx
+                            tmp = state_path.with_suffix(".json.tmp")
+                            with open(tmp, "w") as f:
+                                json.dump(ds.state_dict(), f)
+                            os.replace(tmp, state_path)
+                        except Exception as e:
+                            log.debug("state_dict snapshot failed: %s", e)
+
+                    # Periodic HF upload: every shards_per_upload new shards,
+                    # push that batch and delete local copies so disk stays bounded.
+                    pending_shards = writer.shard_idx - last_uploaded_shard_idx
+                    if upload_enabled and pending_shards >= shards_per_upload:
+                        try:
+                            pushed = _upload_raw_parquet(
+                                out_dir, lang, cfg,
+                                batch_limit=shards_per_upload,
+                            )
+                            last_uploaded_shard_idx += len(pushed)
                         except Exception as up_e:
                             log.warning(
                                 "Periodic upload for %s failed (will retry "
                                 "next cycle): %s", lang, up_e,
+                            )
+
+                    # Back-pressure: if local Parquet count exceeds the cap,
+                    # block streaming and force-flush until uploads catch up.
+                    # Worst-case local disk = max_local_shards × ~60 MB.
+                    if upload_enabled:
+                        local_n = sum(
+                            1 for _ in out_dir.glob(f"{lang}_clean_*.parquet")
+                        )
+                        while local_n > cfg.max_local_shards:
+                            log.warning(
+                                "Local pile-up %d > cap %d for %s; "
+                                "forcing synchronous flush",
+                                local_n, cfg.max_local_shards, lang,
+                            )
+                            try:
+                                pushed = _upload_raw_parquet(
+                                    out_dir, lang, cfg,
+                                    batch_limit=cfg.max_local_shards,
+                                )
+                            except Exception as up_e:
+                                log.warning(
+                                    "Back-pressure upload failed for %s: %s; "
+                                    "letting supervisor restart handle it",
+                                    lang, up_e,
+                                )
+                                break
+                            if not pushed:
+                                # Upload returned nothing — avoid infinite spin
+                                break
+                            last_uploaded_shard_idx += len(pushed)
+                            local_n = sum(
+                                1 for _ in out_dir.glob(
+                                    f"{lang}_clean_*.parquet"
+                                )
                             )
 
                     # Check if we've reached the word target
@@ -525,7 +595,14 @@ def decontaminate_language(
                 writer.save_checkpoint(stats)
                 if upload_enabled and writer.shard_idx > last_uploaded_shard_idx:
                     try:
-                        _upload_raw_parquet(out_dir, lang, cfg)
+                        # Bounded crash-path upload: don't push everything
+                        # at once on crash — the supervisor restart will keep
+                        # draining. Pushing one cycle here just gets the most
+                        # recent work safely off the node.
+                        _upload_raw_parquet(
+                            out_dir, lang, cfg,
+                            batch_limit=shards_per_upload,
+                        )
                     except Exception as up_e:
                         log.warning(
                             "Crash-path upload for %s failed: %s", lang, up_e,
@@ -557,10 +634,14 @@ def decontaminate_language(
     with open(stats_path, "w") as f:
         json.dump(stats.to_dict(), f, indent=2)
 
-    # Successful completion → remove checkpoint so the next run starts fresh
-    # instead of spuriously resuming.
+    # Successful completion → remove checkpoint + stream state so the next
+    # run starts fresh instead of spuriously resuming.
     try:
         (out_dir / f"{lang}_checkpoint.json").unlink(missing_ok=True)
+    except OSError:
+        pass
+    try:
+        state_path.unlink(missing_ok=True)
     except OSError:
         pass
 
@@ -573,25 +654,49 @@ def decontaminate_language(
     # Required for curriculum mode Stages D+3 when running on separate nodes without
     # a shared filesystem. Enable via cfg.upload_raw_parquet = True (or
     # --curriculum-prep flag in launch_full_pipeline.sh).
+    #
+    # Drain loop: push every remaining local shard in bounded cycles until the
+    # local Parquet pile is empty. Each iteration is idempotent (list_repo_files
+    # is consulted), so a supervisor restart mid-drain just resumes from where
+    # the remote left off.
     if getattr(cfg, "upload_raw_parquet", False) and cfg.upload_to_hf:
-        _upload_raw_parquet(out_dir, lang, cfg)
+        while True:
+            pushed = _upload_raw_parquet(
+                out_dir, lang, cfg,
+                batch_limit=cfg.shards_per_upload,
+            )
+            if not pushed:
+                break
 
     return stats
 
 
-def _upload_raw_parquet(out_dir: "Path", lang: str, cfg: "PipelineConfig") -> None:
-    """Upload raw decontaminated Parquet shards to HuggingFace in one batched commit.
+def _upload_raw_parquet(
+    out_dir: "Path",
+    lang: str,
+    cfg: "PipelineConfig",
+    *,
+    batch_limit: Optional[int] = None,
+) -> List["Path"]:
+    """Push up to `batch_limit` local Parquet shards not already on the remote,
+    bundled into one atomic commit, then delete the local copies.
 
     Uploads to: {hf_user}/{lang}-raw-{hf_dataset_suffix}
-    This allows curriculum Stage D nodes to download raw shards without
-    needing a shared filesystem with the decontamination nodes.
+    Returns the list of local paths that were successfully pushed and deleted.
 
-    Uses `upload_large_folder` (huggingface_hub >= 0.26) so the entire folder is
-    pushed in a small number of batched commits (not one commit per shard),
-    staying well under HF's 128-commits-per-hour per-repo rate limit.
-    Falls back to `upload_folder` on older hub versions.
+    Strategy:
+      * Read remote file list via `list_repo_files` → skip already-pushed shards
+        (idempotent across supervisor restarts).
+      * Batch up to `batch_limit` shards plus the latest manifest/stats into a
+        single `create_commit` call. One commit per cycle keeps us well under
+        HF's 128-commits-per-hour per-repo rate limit.
+      * On the first commit, also publish a minimal README.md so
+        `load_dataset(streaming=True)` can auto-discover the Parquet files.
+      * After the commit returns, delete the local Parquet files (manifest +
+        stats are kept locally so resume keeps working).
     """
-    from huggingface_hub import HfApi
+    from huggingface_hub import HfApi, CommitOperationAdd
+    from huggingface_hub.utils import RepositoryNotFoundError
 
     raw_repo = cfg.hf_raw_parquet_repo(lang)
     api = HfApi(token=cfg.hf_token or None)
@@ -601,45 +706,103 @@ def _upload_raw_parquet(out_dir: "Path", lang: str, cfg: "PipelineConfig") -> No
         api.create_repo(raw_repo, repo_type="dataset", exist_ok=True)
     except Exception as e:
         log.warning("Could not create repo %s: %s", raw_repo, e)
-        return
+        return []
 
-    parquet_files = sorted(out_dir.glob("*.parquet"))
-    allow_patterns = [
-        "*.parquet",
-        f"{lang}_manifest.json",
-        f"{lang}_stats.json",
+    # Snapshot remote file list for dedup (idempotency across restarts)
+    try:
+        remote = set(api.list_repo_files(raw_repo, repo_type="dataset"))
+    except RepositoryNotFoundError:
+        remote = set()
+    except Exception as e:
+        log.warning("Could not list remote files for %s: %s", raw_repo, e)
+        return []
+
+    # Sort ensures lexicographic order matches numeric order (zero-padded names)
+    local_shards = sorted(out_dir.glob(f"{lang}_clean_*.parquet"))
+    to_upload = [p for p in local_shards if p.name not in remote]
+    if batch_limit is not None:
+        to_upload = to_upload[:batch_limit]
+
+    if not to_upload:
+        log.info("Nothing to upload for %s (%d local, all on remote)",
+                 lang, len(local_shards))
+        # Still try to delete any local shards that are already on the remote
+        if cfg.delete_after_upload:
+            for p in local_shards:
+                if p.name in remote:
+                    try:
+                        p.unlink()
+                    except OSError:
+                        pass
+        return []
+
+    ops: List[CommitOperationAdd] = [
+        CommitOperationAdd(path_in_repo=p.name, path_or_fileobj=str(p))
+        for p in to_upload
     ]
 
+    # Always include the latest manifest + stats so the remote stays consistent
+    for aux in (f"{lang}_manifest.json", f"{lang}_stats.json"):
+        ap = out_dir / aux
+        if ap.exists():
+            ops.append(
+                CommitOperationAdd(path_in_repo=aux, path_or_fileobj=str(ap))
+            )
+
+    # First commit: also publish a minimal README so `load_dataset` discovers shards.
+    if not remote:
+        readme = (
+            "---\n"
+            "configs:\n"
+            "- config_name: default\n"
+            "  data_files: '*.parquet'\n"
+            "---\n"
+            f"# {raw_repo}\n\n"
+            f"Raw decontaminated FineWeb Parquet shards for `{lang}`.\n"
+            "Each row: text, url, doc_id, word_count.\n"
+        )
+        ops.append(
+            CommitOperationAdd(
+                path_in_repo="README.md",
+                path_or_fileobj=readme.encode("utf-8"),
+            )
+        )
+
     log.info(
-        "Uploading %d raw Parquet shards to %s via upload_large_folder ...",
-        len(parquet_files), raw_repo,
+        "Uploading %d raw Parquet shards to %s (%s..%s) ...",
+        len(to_upload), raw_repo, to_upload[0].name, to_upload[-1].name,
     )
 
     try:
-        if hasattr(api, "upload_large_folder"):
-            api.upload_large_folder(
-                folder_path=str(out_dir),
-                repo_id=raw_repo,
-                repo_type="dataset",
-                allow_patterns=allow_patterns,
-            )
-        else:
-            # Fallback for older huggingface_hub — still batches into one commit
-            log.info(
-                "  upload_large_folder unavailable; falling back to upload_folder"
-            )
-            api.upload_folder(
-                folder_path=str(out_dir),
-                repo_id=raw_repo,
-                repo_type="dataset",
-                allow_patterns=allow_patterns,
-                commit_message=f"Upload raw {lang} Parquet shards ({len(parquet_files)} files)",
-            )
+        api.create_commit(
+            repo_id=raw_repo,
+            repo_type="dataset",
+            operations=ops,
+            commit_message=(
+                f"Upload {lang} shards {to_upload[0].name}..{to_upload[-1].name} "
+                f"({len(to_upload)} files)"
+            ),
+        )
     except Exception as e:
-        log.warning("Batched upload failed for %s: %s", raw_repo, e)
-        return
+        log.warning("Batched commit failed for %s: %s", raw_repo, e)
+        return []
 
-    log.info("Raw Parquet upload complete → %s", raw_repo)
+    log.info("Raw Parquet upload complete → %s (%d shards)",
+             raw_repo, len(to_upload))
+
+    # Delete pushed local Parquet to bound disk usage
+    deleted: List[Path] = []
+    if cfg.delete_after_upload:
+        for p in to_upload:
+            try:
+                p.unlink()
+                deleted.append(p)
+            except OSError as e:
+                log.warning("Could not delete local %s after upload: %s", p, e)
+    else:
+        deleted = list(to_upload)
+
+    return deleted
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
