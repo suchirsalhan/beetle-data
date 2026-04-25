@@ -41,6 +41,21 @@ SKIP_EN_STAGE_2="${SKIP_EN_STAGE_2:-0}"
 LOG_DIR="${PROJECT_ROOT}/logs/stream_missing_28b"
 mkdir -p "${LOG_DIR}" "${OUTPUT_DIR}"
 
+# Push every N raw shards from Stage 2 (default 5 in cfg). Lower → more
+# frequent HF commits → better resume granularity at the cost of more API
+# calls. 2 ≈ every ~100K clean docs.
+export BEETLE_SHARDS_PER_UPLOAD="${BEETLE_SHARDS_PER_UPLOAD:-2}"
+
+# Per-invocation wallclock budget (seconds). On a 12 h SLURM slot, leaving
+# ~20 min headroom for SLURM teardown + any final flush is safe. Each
+# `python -m pipeline.run_pipeline` invocation is wrapped with `timeout`;
+# exit 124 is treated as a soft stop so the user can re-run the script.
+WALLCLOCK_BUDGET_SEC="${WALLCLOCK_BUDGET_SEC:-42000}"
+
+# Track elapsed wallclock across all invocations in this script run so the
+# last language doesn't get more than WALLCLOCK_BUDGET_SEC total.
+SCRIPT_START_TS="${SECONDS}"
+
 if [[ -z "${HF_TOKEN:-}" ]]; then
   echo "WARN: HF_TOKEN is not set — HF push will fail." >&2
 fi
@@ -49,6 +64,41 @@ read -ra LANGS <<<"${LANGS:-zh es ja}"
 read -ra EXTRA_STAGE_ARGS <<<"${EXTRA_STAGE_ARGS:-}"
 
 INDEX_PATH="${OUTPUT_DIR}/benchmark_13gram.pkl"
+
+remaining_budget() {
+  # Seconds left in the script-wide wallclock budget. Floors at 60 to give
+  # subprocesses a chance to start; the caller decides whether to skip.
+  local elapsed=$(( SECONDS - SCRIPT_START_TS ))
+  local remaining=$(( WALLCLOCK_BUDGET_SEC - elapsed ))
+  if (( remaining < 60 )); then
+    echo 60
+  else
+    echo "${remaining}"
+  fi
+}
+
+# Run a pipeline.run_pipeline invocation under `timeout`. Exit code 124
+# (SIGTERM-on-timeout) is treated as a soft stop: the underlying stage's
+# checkpoint logic flushes in-flight state, and the user can re-run this
+# script to resume. Any other non-zero exit is propagated.
+run_with_timeout() {
+  local log="$1"
+  shift
+  local budget
+  budget="$(remaining_budget)"
+  echo "  wallclock budget for this stage: ${budget}s"
+  set +e
+  timeout --signal=TERM --kill-after=60s "${budget}s" \
+      python -m pipeline.run_pipeline "$@" 2>&1 | tee "${log}"
+  local rc="${PIPESTATUS[0]}"
+  set -e
+  if (( rc == 124 )); then
+    echo "  stage hit wallclock budget (exit 124) — treating as soft stop;"
+    echo "  re-run this script to resume from checkpoint."
+    return 0
+  fi
+  return "${rc}"
+}
 
 run_pipeline() {
   local stage="$1"
@@ -59,15 +109,14 @@ run_pipeline() {
   echo "[$(date -u +%FT%TZ)] stage=${stage} lang=${lang}"
   echo "  log: ${log}"
   echo "============================================================"
-  python -m pipeline.run_pipeline \
+  run_with_timeout "${log}" \
       --stage "${stage}" \
       --lang "${lang}" \
       --project-root . \
       --output-dir "${OUTPUT_DIR}" \
       --skip-disk-check \
       "$@" \
-      "${EXTRA_STAGE_ARGS[@]}" \
-      2>&1 | tee "${log}"
+      "${EXTRA_STAGE_ARGS[@]}"
 }
 
 # Stage 1 — build 13-gram benchmark index (one-time, ~5 min).
@@ -75,13 +124,12 @@ if [[ "${SKIP_STAGE_1}" != "1" ]]; then
   echo "============================================================"
   echo "[$(date -u +%FT%TZ)] stage=1 (benchmark index)"
   echo "============================================================"
-  python -m pipeline.run_pipeline \
+  run_with_timeout "${LOG_DIR}/stage1.log" \
       --stage 1 \
       --project-root . \
       --output-dir "${OUTPUT_DIR}" \
       --skip-disk-check \
-      "${EXTRA_STAGE_ARGS[@]}" \
-      2>&1 | tee "${LOG_DIR}/stage1.log"
+      "${EXTRA_STAGE_ARGS[@]}"
 else
   echo "skipping Stage 1 (SKIP_STAGE_1=1) — expecting ${INDEX_PATH}"
 fi
@@ -92,15 +140,19 @@ if [[ ! -f "${INDEX_PATH}" ]]; then
 fi
 
 # Stage 2 — decontaminate. English stream is shared across all L1s,
-# so do it once unless told to skip.
+# so do it once unless told to skip. `--upload-raw-parquet` engages the
+# per-shard HF push path keyed by BEETLE_SHARDS_PER_UPLOAD so the job
+# can be killed at the wallclock boundary and resume from checkpoint.
 if [[ "${SKIP_EN_STAGE_2}" != "1" ]]; then
-  run_pipeline 2 en "${LOG_DIR}/stage2_en.log" --index "${INDEX_PATH}"
+  run_pipeline 2 en "${LOG_DIR}/stage2_en.log" \
+      --index "${INDEX_PATH}" --upload-raw-parquet
 else
   echo "skipping English Stage 2 (SKIP_EN_STAGE_2=1)"
 fi
 
 for LANG in "${LANGS[@]}"; do
-  run_pipeline 2 "${LANG}" "${LOG_DIR}/stage2_${LANG}.log" --index "${INDEX_PATH}"
+  run_pipeline 2 "${LANG}" "${LOG_DIR}/stage2_${LANG}.log" \
+      --index "${INDEX_PATH}" --upload-raw-parquet
 done
 
 # Stage 3 — pretokenize (auto-trains tokenizer if missing) and push to HF.

@@ -67,6 +67,144 @@ log = logging.getLogger("Pretokenize")
 ARROW_FLUSH_CHUNKS = 500_000
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# Resumable per-shard checkpointing + idempotent HF push
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# Mirrors the Stage 2 contract in pipeline/decontaminate_stream.py:
+#   * Atomic JSON checkpoint written after each shard / part.
+#   * Per-part HF upload via HfApi.create_commit (idempotent: list_repo_files
+#     filters anything already on the remote).
+#   * Finalization writes a sentinel marker file (`data/_finalized.json`) on the
+#     remote so a relaunch on a completed repo no-ops.
+
+def _pretok_checkpoint_path(arrow_dir: Path, output_name: str) -> Path:
+    return arrow_dir.parent / f"pretok_checkpoint_{output_name}.json"
+
+
+def _load_pretok_checkpoint(path: Path) -> dict:
+    if not path.exists():
+        return {}
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception as e:
+        log.warning("Failed to load pretok checkpoint %s: %s", path, e)
+        return {}
+
+
+def _save_pretok_checkpoint_atomic(path: Path, ckpt: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".json.tmp")
+    with open(tmp, "w") as f:
+        json.dump(ckpt, f)
+    os.replace(tmp, path)
+
+
+def _list_remote_files(repo_id: str, cfg: "PipelineConfig") -> set:
+    """List files on a HF dataset repo. Returns empty set if repo absent."""
+    from huggingface_hub import HfApi
+    from huggingface_hub.utils import RepositoryNotFoundError
+    api = HfApi(token=cfg.hf_token or None)
+    try:
+        return set(api.list_repo_files(repo_id, repo_type="dataset"))
+    except RepositoryNotFoundError:
+        return set()
+    except Exception as e:
+        log.warning("list_repo_files failed for %s: %s", repo_id, e)
+        return set()
+
+
+def _upload_pretok_part(
+    local_path: Path,
+    path_in_repo: str,
+    repo_id: str,
+    cfg: "PipelineConfig",
+    include_readme: bool,
+) -> bool:
+    """Upload one parquet part to the HF dataset repo as an atomic commit.
+
+    On the first commit (`include_readme=True`), also publishes a minimal
+    README so `load_dataset(repo_id, streaming=True)` discovers the parts.
+    """
+    from huggingface_hub import HfApi, CommitOperationAdd
+
+    api = HfApi(token=cfg.hf_token or None)
+    try:
+        api.create_repo(repo_id, repo_type="dataset", exist_ok=True)
+    except Exception as e:
+        log.warning("Could not create repo %s: %s", repo_id, e)
+        return False
+
+    ops = [CommitOperationAdd(
+        path_in_repo=path_in_repo,
+        path_or_fileobj=str(local_path),
+    )]
+    if include_readme:
+        readme = (
+            "---\n"
+            "configs:\n"
+            "- config_name: default\n"
+            "  data_files: 'data/*.parquet'\n"
+            "---\n"
+            f"# {repo_id}\n\n"
+            "Pretokenized chunks (`input_ids` = 513-token packed sequences,\n"
+            "no cross-document bleeding). Sharded incrementally; the marker\n"
+            "`data/_finalized.json` is committed once all parts are uploaded.\n"
+        )
+        ops.append(CommitOperationAdd(
+            path_in_repo="README.md",
+            path_or_fileobj=readme.encode("utf-8"),
+        ))
+
+    try:
+        api.create_commit(
+            repo_id=repo_id,
+            repo_type="dataset",
+            operations=ops,
+            commit_message=f"Add {path_in_repo}",
+        )
+    except Exception as e:
+        log.warning("Upload commit failed for %s/%s: %s", repo_id, path_in_repo, e)
+        return False
+    return True
+
+
+def _finalize_pretok_repo(
+    repo_id: str,
+    cfg: "PipelineConfig",
+    stats_dict: dict,
+) -> bool:
+    """Write `data/_finalized.json` to signal completion. Idempotent."""
+    from huggingface_hub import HfApi, CommitOperationAdd
+
+    if not cfg.upload_to_hf:
+        return True
+
+    api = HfApi(token=cfg.hf_token or None)
+    existing = _list_remote_files(repo_id, cfg)
+    if "data/_finalized.json" in existing:
+        log.info("Repo %s already finalized — skipping marker", repo_id)
+        return True
+
+    marker = json.dumps(stats_dict, indent=2).encode("utf-8")
+    try:
+        api.create_commit(
+            repo_id=repo_id,
+            repo_type="dataset",
+            operations=[CommitOperationAdd(
+                path_in_repo="data/_finalized.json",
+                path_or_fileobj=marker,
+            )],
+            commit_message="Finalize: all parts uploaded",
+        )
+    except Exception as e:
+        log.warning("Finalize commit failed for %s: %s", repo_id, e)
+        return False
+    log.info("Finalized repo %s", repo_id)
+    return True
+
+
 def ensure_tokenizer(tok_repo: str, lang: str, hf_user: str) -> None:
     """Check if the tokenizer exists on HuggingFace; train and push if missing.
 
@@ -280,21 +418,290 @@ class IncrementalArrowWriter:
         return final_count
 
 
+class ResumablePartWriter:
+    """Buffer chunks; flush each input shard's chunks as a parquet part and push to HF.
+
+    Part files are named `data/{shard_stem}-{sub_idx:02d}.parquet` so that
+    re-processing an interrupted shard overwrites the previous attempt's
+    parts deterministically (HF `create_commit` replaces files with the
+    same `path_in_repo`). This avoids duplicate data when the wallclock
+    kills the job between flushing and `mark_shard_done`.
+
+    Per-shard sequence (driven by ``pretokenize_language``):
+      1. ``start_shard(basename)`` — sets the active shard stem and resets
+          the per-shard sub_idx to 0.
+      2. ``add_chunks(...)`` repeatedly as worker results arrive. If the
+          buffer crosses ``flush_threshold`` mid-shard, an interim part is
+          flushed (rare with default settings: shard ≪ threshold).
+      3. ``flush_now()`` — emits a final per-shard part for any buffered
+          tail. One part per shard with default settings.
+      4. ``mark_shard_done(basename)`` — appends to ``parquet_shards_done``.
+
+    Resume contract:
+      * On startup, any leftover staging files are uploaded before resuming
+        (handles a crash between local write and remote commit).
+      * ``parquet_shards_done`` lets ``pretokenize_language`` skip already-
+        completed input shards.
+      * ``chunks_committed`` / ``target_chunks`` enable a clean stop when
+        the per-side token budget is reached.
+
+    If ``cfg.upload_to_hf`` is False, this writer falls back to local-only
+    behavior: parquet parts are kept in ``<arrow_dir>/data/`` so downstream
+    code can still load them with
+    ``load_dataset("parquet", data_files=...)``.
+    """
+
+    def __init__(
+        self,
+        arrow_dir: Path,
+        repo_id: str,
+        output_name: str,
+        cfg: "PipelineConfig",
+        flush_threshold: int,
+        target_chunks: int,
+    ):
+        self.arrow_dir = Path(arrow_dir)
+        self.repo_id = repo_id
+        self.output_name = output_name
+        self.cfg = cfg
+        self.flush_threshold = max(1, int(flush_threshold))
+        self.target_chunks = int(target_chunks)
+        self.upload_enabled = bool(getattr(cfg, "upload_to_hf", True))
+
+        # Staging dir holds parquet files between local write and HF upload.
+        # When upload is disabled, parts land directly in `data/` for local use.
+        if self.upload_enabled:
+            self.local_dir = self.arrow_dir / "_staging"
+        else:
+            self.local_dir = self.arrow_dir / "data"
+        self.local_dir.mkdir(parents=True, exist_ok=True)
+
+        self.checkpoint_path = _pretok_checkpoint_path(self.arrow_dir, output_name)
+        ckpt = _load_pretok_checkpoint(self.checkpoint_path)
+        self.parquet_shards_done: List[str] = list(ckpt.get("parquet_shards_done", []))
+        self.parts_uploaded: List[str] = list(ckpt.get("parts_uploaded", []))
+        self.chunks_committed: int = int(ckpt.get("chunks_committed", 0))
+        # Mirror stats so resume preserves cumulative counters.
+        self.tokens_total: int = int(ckpt.get("tokens_total", 0))
+        self.docs_processed: int = int(ckpt.get("docs_processed", 0))
+        self.tokens_discarded: int = int(ckpt.get("tokens_discarded", 0))
+        self.shards_read: int = int(ckpt.get("shards_read", 0))
+
+        self.buffer: List[List[int]] = []
+        # Per-shard cursor (set by start_shard()).
+        self._current_shard_stem: Optional[str] = None
+        self._current_sub_idx: int = 0
+
+        if self.upload_enabled:
+            self._drain_staging_on_start()
+
+    # ------------------------------------------------------------------
+    # Checkpoint persistence
+    # ------------------------------------------------------------------
+
+    def _save_checkpoint(self) -> None:
+        ckpt = {
+            "parquet_shards_done": self.parquet_shards_done,
+            "parts_uploaded": self.parts_uploaded,
+            "chunks_committed": self.chunks_committed,
+            "target_chunks": self.target_chunks,
+            "tokens_total": self.tokens_total,
+            "docs_processed": self.docs_processed,
+            "tokens_discarded": self.tokens_discarded,
+            "shards_read": self.shards_read,
+        }
+        _save_pretok_checkpoint_atomic(self.checkpoint_path, ckpt)
+
+    # ------------------------------------------------------------------
+    # Crash-recovery: upload anything left in staging before resuming
+    # ------------------------------------------------------------------
+
+    def _drain_staging_on_start(self) -> None:
+        leftover = sorted(self.local_dir.glob("*.parquet"))
+        if not leftover:
+            return
+        log.info("Found %d staged parts in %s — uploading before resuming",
+                 len(leftover), self.local_dir)
+        remote = _list_remote_files(self.repo_id, self.cfg)
+        for staged in leftover:
+            path_in_repo = f"data/{staged.name}"
+            include_readme = (
+                not any(f.startswith("README") for f in remote)
+                and not self.parts_uploaded
+            )
+            ok = _upload_pretok_part(
+                staged, path_in_repo, self.repo_id, self.cfg, include_readme,
+            )
+            if not ok:
+                raise RuntimeError(
+                    f"Failed to upload staged part {staged} to {self.repo_id} — "
+                    f"local file kept for next restart"
+                )
+            remote.add(path_in_repo)
+            if path_in_repo not in self.parts_uploaded:
+                self.parts_uploaded.append(path_in_repo)
+            try:
+                staged.unlink()
+            except OSError:
+                pass
+        self._save_checkpoint()
+
+    # ------------------------------------------------------------------
+    # Public API used by pretokenize_language
+    # ------------------------------------------------------------------
+
+    def is_done(self) -> bool:
+        return self.target_chunks > 0 and self.chunks_committed >= self.target_chunks
+
+    def shard_is_done(self, shard_basename: str) -> bool:
+        return shard_basename in self.parquet_shards_done
+
+    def start_shard(self, shard_basename: str) -> None:
+        """Begin a new input shard. Resets the per-shard sub-index to 0.
+
+        Subsequent flushes write `data/{shard_stem}-{sub_idx:02d}.parquet`
+        with sub_idx counting from zero. Re-processing the same shard on
+        resume produces deterministic file names and overwrites the
+        previous attempt's parts (HF `create_commit` replaces by path).
+        """
+        # Strip the .parquet extension once; tolerate any other suffix.
+        self._current_shard_stem = Path(shard_basename).stem
+        self._current_sub_idx = 0
+
+    def add_chunks(self, chunks: List[List[int]]) -> bool:
+        """Add chunks to the buffer; auto-flush only if the soft threshold is
+        exceeded mid-shard (rare).
+
+        Returns True if the per-side target was reached (caller should stop).
+        """
+        if not chunks:
+            return self.is_done()
+
+        # Truncate to remaining budget so we never overshoot target_chunks.
+        already = self.chunks_committed + len(self.buffer)
+        remaining = self.target_chunks - already
+        if remaining <= 0:
+            return True
+        if len(chunks) > remaining:
+            chunks = chunks[:remaining]
+
+        self.buffer.extend(chunks)
+        # Soft fallback: only kicks in if a single input shard yields more
+        # chunks than the buffer cap. With default config (shard=50K docs,
+        # threshold=500K chunks) this branch never executes.
+        while len(self.buffer) >= self.flush_threshold:
+            head = self.buffer[: self.flush_threshold]
+            self.buffer = self.buffer[self.flush_threshold:]
+            self._flush(head)
+            if self.is_done():
+                self.buffer.clear()
+                return True
+        return self.is_done()
+
+    def flush_now(self) -> None:
+        """Emit a part for whatever is in the buffer, even if below threshold."""
+        if self.buffer:
+            head = self.buffer
+            self.buffer = []
+            self._flush(head)
+
+    def mark_shard_done(self, shard_basename: str) -> None:
+        if shard_basename not in self.parquet_shards_done:
+            self.parquet_shards_done.append(shard_basename)
+            self._save_checkpoint()
+
+    def update_stats(self, *, tokens: int = 0, docs: int = 0,
+                     discarded: int = 0, shards: int = 0) -> None:
+        self.tokens_total += int(tokens)
+        self.docs_processed += int(docs)
+        self.tokens_discarded += int(discarded)
+        self.shards_read += int(shards)
+
+    # ------------------------------------------------------------------
+    # Internal flush
+    # ------------------------------------------------------------------
+
+    def _flush(self, chunks: List[List[int]]) -> None:
+        if not chunks:
+            return
+        import pyarrow as pa
+        import pyarrow.parquet as pq_writer
+
+        if self._current_shard_stem is None:
+            # Caller forgot to call start_shard(); fall back to a generic name.
+            stem = f"orphan-{len(self.parts_uploaded):05d}"
+        else:
+            stem = self._current_shard_stem
+        part_name = f"{stem}-{self._current_sub_idx:02d}.parquet"
+        local_path = self.local_dir / part_name
+        path_in_repo = f"data/{part_name}"
+
+        table = pa.Table.from_pydict({"input_ids": chunks})
+        pq_writer.write_table(table, str(local_path))
+
+        if self.upload_enabled:
+            include_readme = not self.parts_uploaded
+            ok = _upload_pretok_part(
+                local_path, path_in_repo, self.repo_id, self.cfg, include_readme,
+            )
+            if not ok:
+                raise RuntimeError(
+                    f"Upload failed for {path_in_repo}; staged at {local_path} — "
+                    f"will be retried on next supervisor restart"
+                )
+
+        if path_in_repo not in self.parts_uploaded:
+            self.parts_uploaded.append(path_in_repo)
+        self.chunks_committed += len(chunks)
+        self._current_sub_idx += 1
+        self._save_checkpoint()
+
+        if self.upload_enabled:
+            try:
+                local_path.unlink()
+            except OSError:
+                pass
+            log.info(
+                "  Pushed %s: %d chunks (committed %d / %d)",
+                path_in_repo, len(chunks),
+                self.chunks_committed, self.target_chunks,
+            )
+        else:
+            log.info(
+                "  Wrote %s: %d chunks (committed %d / %d)",
+                local_path, len(chunks),
+                self.chunks_committed, self.target_chunks,
+            )
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Parquet Shard Iterator (memory-safe)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _iter_parquet_shards(parquet_dir: Path):
+def _iter_parquet_shards(parquet_dir: Path, skip_basenames: Optional[set] = None):
     """Yield (shard_path, texts) for each Parquet shard, one at a time.
 
     Only one shard's text data is in memory at any point.
     Each shard is ~50K docs * ~5 KB avg = ~250 MB in RAM.
+
+    Shards whose filename is in `skip_basenames` are filtered out before
+    being read, so resume after a wallclock kill never re-reads a shard
+    whose chunks are already on the destination HF repo.
     """
     shard_files = sorted(parquet_dir.glob("*.parquet"))
     if not shard_files:
         raise FileNotFoundError(f"No Parquet shards found in {parquet_dir}")
 
-    log.info("Found %d Parquet shards in %s", len(shard_files), parquet_dir)
+    skip = skip_basenames or set()
+    n_total = len(shard_files)
+    shard_files = [p for p in shard_files if p.name not in skip]
+    if skip:
+        log.info(
+            "Found %d Parquet shards in %s (%d skipped via checkpoint)",
+            len(shard_files), parquet_dir, n_total - len(shard_files),
+        )
+    else:
+        log.info("Found %d Parquet shards in %s", len(shard_files), parquet_dir)
 
     for shard_path in shard_files:
         table = pq.read_table(str(shard_path), columns=["text"])
@@ -367,8 +774,38 @@ def pretokenize_language(
     target_chunks = target_tokens // cfg.chunk_len
     log.info("  Target: %d tokens (%d chunks)", target_tokens, target_chunks)
 
-    # Incremental Arrow writer (flushes to disk every 500K chunks ≈ 2 GB)
-    writer = IncrementalArrowWriter(arrow_dir)
+    # Resumable per-shard writer with periodic HF push (idempotent on restart).
+    # Each input Parquet shard, once fully tokenized, contributes one or more
+    # parquet "parts" pushed atomically to the destination HF dataset repo;
+    # the local checkpoint records done-shards + uploaded parts so a wallclock
+    # kill + re-launch picks up where it left off.
+    repo_id = cfg.hf_dataset_repo(lang, side)
+    writer = ResumablePartWriter(
+        arrow_dir=arrow_dir,
+        repo_id=repo_id,
+        output_name=output_name,
+        cfg=cfg,
+        flush_threshold=ARROW_FLUSH_CHUNKS,
+        target_chunks=target_chunks,
+    )
+
+    # Seed stats from any prior progress so resume reports cumulative counters.
+    stats.tokens_total = writer.tokens_total
+    stats.docs_processed = writer.docs_processed
+    stats.tokens_discarded = writer.tokens_discarded
+    stats.shards_read = writer.shards_read
+
+    if writer.is_done():
+        log.info(
+            "Pretokenization for %s/%s already complete per checkpoint "
+            "(%d / %d chunks committed) — skipping to finalize",
+            lang, side, writer.chunks_committed, target_chunks,
+        )
+        stats.chunks_created = writer.chunks_committed
+        stats.arrow_parts_written = writer.next_part_idx
+        stats.wall_time_sec = time.time() - t0
+        _finalize_pretok_repo(repo_id, cfg, stats.to_dict())
+        return stats
 
     # Process Parquet shards one at a time
     num_workers = min(cfg.num_workers, cpu_count())
@@ -377,6 +814,7 @@ def pretokenize_language(
 
     pbar = tqdm(
         total=target_tokens,
+        initial=writer.tokens_total,
         unit="tok",
         desc=f"Tokenizing {output_name}",
         unit_scale=True,
@@ -389,10 +827,13 @@ def pretokenize_language(
         initargs=(tok_repo, cfg.chunk_len),
     ) as pool:
 
-        for shard_path, texts in _iter_parquet_shards(parquet_dir):
+        skip = set(writer.parquet_shards_done)
+        for shard_path, texts in _iter_parquet_shards(parquet_dir, skip_basenames=skip):
             if reached_target:
                 break
 
+            shard_basename = shard_path.name
+            writer.start_shard(shard_basename)
             stats.shards_read += 1
 
             # Split this shard's texts into batches for parallel tokenization
@@ -402,32 +843,54 @@ def pretokenize_language(
             ]
             del texts  # free shard text memory before processing
 
+            shard_tokens = 0
+            shard_discarded = 0
+            shard_docs = 0
             for result in pool.imap(_process_text_batch, text_batches, chunksize=1):
                 chunks, tok_count, disc_count = result
+                shard_tokens += tok_count
+                shard_discarded += disc_count
+                shard_docs += batch_size
 
-                writer.add_chunks(chunks)
                 stats.tokens_total += tok_count
                 stats.tokens_discarded += disc_count
                 stats.docs_processed += batch_size
                 pbar.update(tok_count)
 
-                # Check if we've accumulated enough chunks
-                if writer.total_chunks + len(writer.buffer) >= target_chunks:
+                if writer.add_chunks(chunks):
                     reached_target = True
                     break
 
+            # Persist any partial buffer for this shard so the part contains
+            # only data from completed shards (clean per-shard resume).
+            writer.flush_now()
+            writer.update_stats(
+                tokens=shard_tokens,
+                docs=shard_docs,
+                discarded=shard_discarded,
+                shards=1,
+            )
+            writer.mark_shard_done(shard_basename)
+
     pbar.close()
 
-    # Finalize: flush remaining buffer, concatenate parts, truncate to target
-    final_count = writer.finalize(target_chunks=target_chunks)
-    stats.chunks_created = final_count
-    stats.arrow_parts_written = writer.part_idx
+    # Final flush + push any remaining buffered chunks (no-op if reached_target
+    # already drained the buffer).
+    writer.flush_now()
+
+    stats.chunks_created = writer.chunks_committed
+    stats.arrow_parts_written = writer.next_part_idx
     stats.wall_time_sec = time.time() - t0
 
-    # Save stats
+    # Save stats locally (matches old behavior; useful even when uploads happen).
+    arrow_dir.mkdir(parents=True, exist_ok=True)
     stats_path = arrow_dir / "pretok_stats.json"
     with open(stats_path, "w") as f:
         json.dump(stats.to_dict(), f, indent=2)
+
+    # Publish the finalize marker on the HF repo so a re-launch detects
+    # completion and short-circuits.
+    _finalize_pretok_repo(repo_id, cfg, stats.to_dict())
 
     log.info("Done %s/%s: %d chunks (%d tokens), %d shards read, %.1f min",
              lang, side, stats.chunks_created,
@@ -498,24 +961,26 @@ def pretokenize_pair(
     lang: str,
     cfg: PipelineConfig,
 ) -> Tuple[PretokenizationStats, PretokenizationStats]:
-    """Pretokenize both L1 and EN sides, upload to HF, clean up local files.
+    """Pretokenize both L1 and EN sides; resume-safe across wallclock kills.
 
-    Storage-optimized flow:
-      1. Pretokenize L1 → upload to HF → delete local Arrow
-      2. Pretokenize EN → upload to HF → delete local Arrow
-      3. Delete L1 Parquet (EN Parquet kept for other pairs)
+    Each call to ``pretokenize_language`` streams its parts to the
+    destination HF repo as they are produced (see ``ResumablePartWriter``)
+    and writes ``data/_finalized.json`` once the per-side target is reached,
+    so there is no separate end-of-stage upload step. Re-running this
+    function on a partially-completed pair resumes exactly where the last
+    invocation stopped.
     """
-    # L1 side
+    # L1 side — incremental push to cfg.hf_dataset_repo(lang, 'l1')
     l1_stats = pretokenize_language(lang, "l1", cfg)
     l1_arrow_dir = Path(cfg.output_dir) / "pretokenized" / lang
-    l1_repo = cfg.hf_dataset_repo(lang, "l1")
-    upload_to_hf_and_cleanup(l1_arrow_dir, l1_repo, cfg)
+    if cfg.cleanup_after_upload and cfg.upload_to_hf:
+        shutil.rmtree(l1_arrow_dir, ignore_errors=True)
 
-    # EN side
+    # EN side — incremental push to cfg.hf_dataset_repo(lang, 'en')
     en_stats = pretokenize_language(lang, "en", cfg)
     en_arrow_dir = Path(cfg.output_dir) / "pretokenized" / f"en_for_{lang}"
-    en_repo = cfg.hf_dataset_repo(lang, "en")
-    upload_to_hf_and_cleanup(en_arrow_dir, en_repo, cfg)
+    if cfg.cleanup_after_upload and cfg.upload_to_hf:
+        shutil.rmtree(en_arrow_dir, ignore_errors=True)
 
     # Clean up L1 Parquet (no longer needed)
     cleanup_stage2_parquet(lang, cfg)
