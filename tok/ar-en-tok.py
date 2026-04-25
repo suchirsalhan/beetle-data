@@ -26,6 +26,7 @@ Arabic-specific normalization choices (see build_tokenizer):
                 (they are rare in web text; stripping harms diacritized religious text)
 """
 
+import argparse
 import os
 import re
 from pathlib import Path
@@ -45,12 +46,11 @@ from huggingface_hub import create_repo
 # =====================================================
 # CONFIG
 # =====================================================
-HF_USER             = "RA-ALTA"
+HF_USER             = "Beetle-Data"
 HF_TOKEN            = os.environ.get("HF_TOKEN")
 LANG                = "ar"
 VOCAB_SIZE          = 50_000
 BOOTSTRAP_SENTENCES = 2_000_000   # total sentences (split 50/50 ar/en)
-REPO_ID             = f"{HF_USER}/tokenizer-{LANG}-en"
 OUT_DIR             = Path("tokenizer-local-temp")
 OUT_DIR.mkdir(exist_ok=True)
 
@@ -170,13 +170,18 @@ def build_tokenizer() -> Tokenizer:
 # =====================================================
 # 3. TRAIN & PUSH
 # =====================================================
-def train_and_push():
-    print(f"🚀 Training Unigram tokenizer for '{LANG}+en'  (vocab={VOCAB_SIZE:,})…")
+def train_and_push(hf_user: str = HF_USER, vocab_size: int = VOCAB_SIZE,
+                   sentences: int = BOOTSTRAP_SENTENCES):
+    repo_id = f"{hf_user}/tokenizer-{LANG}-en"
+    global BOOTSTRAP_SENTENCES
+    BOOTSTRAP_SENTENCES = sentences
+
+    print(f"🚀 Training Unigram tokenizer for '{LANG}+en'  (vocab={vocab_size:,}) → {repo_id}…")
 
     tokenizer = build_tokenizer()
 
     trainer = trainers.UnigramTrainer(
-        vocab_size=VOCAB_SIZE,
+        vocab_size=vocab_size,
         special_tokens=["<unk>", "<s>", "</s>", "<pad>"],
         unk_token="<unk>",
         # shrinking_factor: fraction of vocab kept each EM pruning round
@@ -206,9 +211,9 @@ def train_and_push():
     print(f"✅ Tokenizer saved → {OUT_DIR}")
 
     if HF_TOKEN:
-        create_repo(REPO_ID, exist_ok=True, token=HF_TOKEN)
-        hf_tokenizer.push_to_hub(REPO_ID, token=HF_TOKEN)
-        print(f"✅ Pushed → https://huggingface.co/{REPO_ID}")
+        create_repo(repo_id, exist_ok=True, token=HF_TOKEN)
+        hf_tokenizer.push_to_hub(repo_id, token=HF_TOKEN)
+        print(f"✅ Pushed → https://huggingface.co/{repo_id}")
     else:
         print("⚠️  HF_TOKEN not set — skipping Hub push.")
 
@@ -307,6 +312,14 @@ def inspect_vocab(n: int = 40):
 # MAIN
 # =====================================================
 if __name__ == "__main__":
-    train_and_push()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--hf-user", default=HF_USER,
+                        help="HF org/user to push the tokenizer to (default: Beetle-Data)")
+    parser.add_argument("--vocab-size", type=int, default=VOCAB_SIZE)
+    parser.add_argument("--sentences", type=int, default=BOOTSTRAP_SENTENCES)
+    args = parser.parse_args()
+
+    train_and_push(hf_user=args.hf_user, vocab_size=args.vocab_size,
+                   sentences=args.sentences)
     run_benchmark()
     inspect_vocab(n=40)
