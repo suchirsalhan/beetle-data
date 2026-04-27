@@ -37,8 +37,13 @@
 #SBATCH --mail-type=FAIL
 #SBATCH --no-requeue
 #SBATCH -p ampere
-#SBATCH -o logs/stream_missing_28b/zh-sl2-%j.out
-#SBATCH -e logs/stream_missing_28b/zh-sl2-%j.err
+#SBATCH --chdir=/rds/user/sas245/hpc-work/beetle-data
+#SBATCH -o /rds/user/sas245/hpc-work/beetle-data/logs/stream_missing_28b/zh-sl2-%j.out
+#SBATCH -e /rds/user/sas245/hpc-work/beetle-data/logs/stream_missing_28b/zh-sl2-%j.err
+# NOTE: --chdir / -o / -e use absolute /rds paths because /home/<crsid> is
+# read-only on Wilkes3 compute nodes, and SBATCH directives don't expand env
+# vars. Submit via scripts/submit_stream_missing_28b_sl2.sh to override these
+# with CRSid-agnostic ${HPC_WORK} paths.
 
 set -euo pipefail
 
@@ -59,6 +64,20 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BEETLE_DATA="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${BEETLE_DATA}"
 
+# Defence-in-depth: if BEETLE_DATA resolved through /home/<user>/... it will be
+# read-only on Wilkes3 compute nodes. Switch to the writable RDS location.
+if ! ( : > .beetle_write_test 2>/dev/null ); then
+    if [ -n "${HPC_WORK:-}" ] && [ -d "${HPC_WORK}/beetle-data" ]; then
+        echo "WARN: ${BEETLE_DATA} is read-only; switching to ${HPC_WORK}/beetle-data" >&2
+        BEETLE_DATA="${HPC_WORK}/beetle-data"
+        cd "${BEETLE_DATA}"
+    else
+        echo "ERROR: ${BEETLE_DATA} is read-only and \$HPC_WORK is unset" >&2
+        exit 1
+    fi
+fi
+rm -f .beetle_write_test
+
 mkdir -p logs/stream_missing_28b
 
 # ── venv: prefer repo convention, fall back to user template layout ─────────
@@ -77,7 +96,7 @@ echo "Python:  $(which python)  ($(python --version 2>&1))"
 # ── Pipeline env ────────────────────────────────────────────────────────────
 export OMP_NUM_THREADS=1
 export TOKENIZERS_PARALLELISM=true
-export OUTPUT_DIR="${OUTPUT_DIR:-pipeline_output}"
+export OUTPUT_DIR="${OUTPUT_DIR:-${HPC_WORK:-$PWD}/beetle-data/pipeline_output}"
 export HF_HOME="${HF_HOME:-${OUTPUT_DIR}/.cache/huggingface}"
 
 if [ -z "${HF_TOKEN:-}" ]; then
