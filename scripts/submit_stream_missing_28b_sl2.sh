@@ -31,10 +31,13 @@ fi
 
 mkdir -p "${LOGDIR}"
 
+# Propagate HPC_WORK explicitly: --export=ALL is unreliable on CSD3 because the
+# compute node's bash init may not re-set it, and the in-script self-heal needs
+# it to recover from a read-only CWD.
 exec sbatch \
     --chdir="${PROJECT}" \
     -o "${LOGDIR}/zh-sl2-%j.out" \
     -e "${LOGDIR}/zh-sl2-%j.err" \
-    --export=ALL,HF_TOKEN="${HF_TOKEN}" \
+    --export=ALL,HF_TOKEN="${HF_TOKEN}",HPC_WORK="${HPC_WORK}" \
     "$@" \
     "${PROJECT}/scripts/stream_missing_28b_sl2.sh"

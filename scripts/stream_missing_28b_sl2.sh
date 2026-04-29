@@ -60,23 +60,42 @@ echo "PWD:     $(pwd)"
 echo "Node:    ${SLURM_JOB_NODELIST:-n/a}"
 
 # ── Project root ────────────────────────────────────────────────────────────
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BEETLE_DATA="$(cd "${SCRIPT_DIR}/.." && pwd)"
+# Under SLURM, ${BASH_SOURCE[0]} points at /var/spool/slurm/slurmd/jobNNN/slurm_script
+# (a read-only copy), NOT at scripts/stream_missing_28b_sl2.sh. So derive
+# BEETLE_DATA from SLURM_SUBMIT_DIR (set by sbatch) or the current PWD (set by
+# --chdir). Only fall back to BASH_SOURCE when running outside SLURM.
+if [ -n "${SLURM_SUBMIT_DIR:-}" ]; then
+    BEETLE_DATA="${SLURM_SUBMIT_DIR}"
+elif [ -n "${SLURM_JOB_ID:-}" ]; then
+    BEETLE_DATA="$(pwd)"
+else
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    BEETLE_DATA="$(cd "${SCRIPT_DIR}/.." && pwd)"
+fi
 cd "${BEETLE_DATA}"
 
-# Defence-in-depth: if BEETLE_DATA resolved through /home/<user>/... it will be
-# read-only on Wilkes3 compute nodes. Switch to the writable RDS location.
-if ! ( : > .beetle_write_test 2>/dev/null ); then
-    if [ -n "${HPC_WORK:-}" ] && [ -d "${HPC_WORK}/beetle-data" ]; then
-        echo "WARN: ${BEETLE_DATA} is read-only; switching to ${HPC_WORK}/beetle-data" >&2
-        BEETLE_DATA="${HPC_WORK}/beetle-data"
-        cd "${BEETLE_DATA}"
-    else
-        echo "ERROR: ${BEETLE_DATA} is read-only and \$HPC_WORK is unset" >&2
+# Defence-in-depth: if BEETLE_DATA is read-only (e.g. /home/<user>/... on
+# Wilkes3 compute nodes, or the SLURM spool dir), switch to writable RDS.
+WRITE_TEST="$(mktemp -u .beetle_write_test.XXXXXX)"
+if ! ( : > "${WRITE_TEST}" 2>/dev/null ); then
+    for candidate in \
+        "${HPC_WORK:-}/beetle-data" \
+        "/rds/user/${USER}/hpc-work/beetle-data" \
+        "/rds/user/${SLURM_JOB_USER:-$USER}/hpc-work/beetle-data"
+    do
+        if [ -n "${candidate}" ] && [ -d "${candidate}" ]; then
+            echo "WARN: ${BEETLE_DATA} is read-only; switching to ${candidate}" >&2
+            BEETLE_DATA="${candidate}"
+            cd "${BEETLE_DATA}"
+            break
+        fi
+    done
+    if ! ( : > "${WRITE_TEST}" 2>/dev/null ); then
+        echo "ERROR: no writable beetle-data dir found (tried HPC_WORK, /rds/user/${USER})" >&2
         exit 1
     fi
 fi
-rm -f .beetle_write_test
+rm -f "${WRITE_TEST}"
 
 mkdir -p logs/stream_missing_28b
 
